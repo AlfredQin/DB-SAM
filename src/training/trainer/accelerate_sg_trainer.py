@@ -1,0 +1,2640 @@
+import copy
+import inspect
+import os
+import typing
+import warnings
+from copy import deepcopy
+from typing import Union, Tuple, Mapping, Dict, Any, List, Optional
+
+from accelerate import Accelerator, DistributedType
+from accelerate.utils import set_seed, PrecisionType, KwargsHandler
+
+import hydra
+import numpy as np
+import torch
+import torch.cuda
+import torch.nn
+import torchmetrics
+from omegaconf import DictConfig, OmegaConf
+
+from torch import nn
+from torch.utils.data import DataLoader
+from torchmetrics import MetricCollection, Metric
+from tqdm import tqdm
+
+from super_gradients.common.environment.checkpoints_dir_utils import (
+    generate_run_id,
+    get_latest_run_id,
+    validate_run_id,
+    get_checkpoints_dir_path,
+)
+from super_gradients.module_interfaces import HasPreprocessingParams, HasPredict
+from super_gradients.modules.repvgg_block import fuse_repvgg_blocks_residual_branches
+
+from super_gradients.training.utils.sg_trainer_utils import get_callable_param_names
+from super_gradients.training.utils.callbacks.callbacks import create_lr_scheduler_callback, LRSchedulerCallback
+from super_gradients.common.abstractions.abstract_logger import get_logger
+from super_gradients.common.sg_loggers.abstract_sg_logger import AbstractSGLogger
+from super_gradients.common.sg_loggers.base_sg_logger import BaseSGLogger
+from super_gradients.common.data_types.enum import StrictLoad, EvaluationType
+from super_gradients.common.decorators.factory_decorator import resolve_param
+from super_gradients.common.factories.callbacks_factory import CallbacksFactory
+from super_gradients.common.factories.list_factory import ListFactory
+from super_gradients.common.factories.losses_factory import LossesFactory
+from super_gradients.common.factories.metrics_factory import MetricsFactory
+from super_gradients.common.environment.package_utils import get_installed_packages
+from super_gradients.common.environment.cfg_utils import maybe_instantiate_test_loaders
+
+from super_gradients.training import utils as core_utils, models, dataloaders
+from super_gradients.common.exceptions.sg_trainer_exceptions import UnsupportedOptimizerFormat
+from super_gradients.training.metrics.metric_utils import (
+    get_metrics_titles,
+    get_metrics_results_tuple,
+    get_logging_values,
+    get_metrics_dict,
+    get_train_loop_description_dict,
+)
+from super_gradients.training.models import SgModule, get_model_name
+from super_gradients.common.registry.registry import ARCHITECTURES, SG_LOGGERS
+from super_gradients.training.utils import sg_trainer_utils, get_param
+from super_gradients.training.utils.distributed_training_utils import (
+    reduce_results_tuple_for_ddp,
+    compute_precise_bn_stats,
+    get_gpu_mem_utilization,
+    wait_for_the_master,
+)
+from super_gradients.common.environment.ddp_utils import (
+    get_local_rank,
+    is_ddp_subprocess,
+    get_world_size,
+    broadcast_from_master,
+)
+from super_gradients.training.utils.ema import ModelEMA
+from super_gradients.training.utils.optimizer_utils import build_optimizer, get_initial_lr_from_optimizer
+from super_gradients.training.utils.sg_trainer_utils import MonitoredValue, log_main_training_params
+from super_gradients.training.utils.utils import fuzzy_idx_in_list
+from super_gradients.training.utils.weight_averaging_utils import ModelWeightAveraging
+from super_gradients.training.metrics import Accuracy, Top5
+from super_gradients.training.utils.checkpoint_utils import (
+    read_ckpt_state_dict,
+    load_pretrained_weights,
+    get_scheduler_state,
+    adaptive_load_state_dict,
+    _maybe_load_preprocessing_params,
+)
+from super_gradients.training.datasets.datasets_utils import DatasetStatisticsTensorboardLogger
+from super_gradients.training.utils.callbacks import (
+    CallbackHandler,
+    Phase,
+    PhaseContext,
+    MetricsUpdateCallback,
+    LRCallbackBase,
+)
+from super_gradients.common.registry.registry import LR_WARMUP_CLS_DICT
+from super_gradients.training.utils import HpmStruct
+from super_gradients.common.environment.cfg_utils import load_experiment_cfg, add_params_to_cfg, load_recipe
+from super_gradients.common.factories.pre_launch_callbacks_factory import PreLaunchCallbacksFactory
+from super_gradients.training.params import TrainingParams
+from super_gradients.module_interfaces import ExportableObjectDetectionModel
+from super_gradients.conversion import ExportQuantizationMode
+
+logger = get_logger(__name__)
+
+try:
+    from super_gradients.training.utils.quantization.calibrator import QuantizationCalibrator
+    from super_gradients.training.utils.quantization.export import export_quantized_module_to_onnx
+    from super_gradients.training.utils.quantization.selective_quantization_utils import SelectiveQuantizer
+
+    _imported_pytorch_quantization_failure = None
+
+except (ImportError, NameError, ModuleNotFoundError) as import_err:
+    logger.debug("Failed to import pytorch_quantization:")
+    logger.debug(import_err)
+    _imported_pytorch_quantization_failure = import_err
+
+
+class Trainer:
+    """
+    SuperGradient Model - Base Class for Sg Models
+
+    Methods
+    -------
+    train(max_epochs : int, initial_epoch : int, save_model : bool)
+        the main function used for the training, h.p. updating, logging etc.
+
+    predict(idx : int)
+        returns the predictions and label of the current inputs
+
+    test(epoch : int, idx : int, save : bool):
+        returns the test loss, accuracy and runtime
+    """
+
+    def __init__(
+            self,
+            experiment_name: str,
+            ckpt_root_dir: Optional[str] = None,
+            mixed_precision: PrecisionType | str | None = None,
+            kwargs_handlers: list[KwargsHandler] | None = None,
+    ):
+        """
+
+        :param experiment_name:                 Used for logging and loading purposes
+                                                checkpoint from cloud service, otherwise overwrites the local checkpoints file
+        :param ckpt_root_dir:                   Local root directory path where all experiment logging directories will
+                                                reside. When none is give, it is assumed that
+                                                pkg_resources.resource_filename('checkpoints', "") exists and will be used.
+
+        """
+        # NOTE: Should initialize the accelerator before anything else, or there will be a bug in the distributed
+        self.accelerator = Accelerator(
+            mixed_precision=mixed_precision,
+            kwargs_handlers=kwargs_handlers
+        )
+
+        # SET THE EMPTY PROPERTIES
+        self.net, self.architecture, self.arch_params, self.dataset_interface = None, None, None, None
+        self.train_loader, self.valid_loader, self.test_loaders = None, None, {}
+        self.ema = None
+        self.ema_model = None
+        self.sg_logger = None
+        self.update_param_groups = None
+        self.criterion = None
+        self.training_params = None
+        self.scaler = None
+        self.phase_callbacks = None
+        self.checkpoint_params = None
+        self.pre_prediction_callback = None
+
+        # SET THE DEFAULT PROPERTIES
+        self.half_precision = False
+        self.load_backbone = False
+        self.load_weights_only = False
+        self.ddp_silent_mode = is_ddp_subprocess()
+
+        self.model_weight_averaging = None
+        self.average_model_checkpoint_filename = "average_model.pth"
+        self.start_epoch = 0
+        self.best_metric = np.inf
+        self.load_ema_as_net = False
+
+        self._first_backward = True
+
+        # METRICS
+        self.loss_logging_items_names = None
+        self.train_metrics: Optional[MetricCollection] = None
+        self.valid_metrics: Optional[MetricCollection] = None
+        self.test_metrics: Optional[MetricCollection] = None
+        self.greater_metric_to_watch_is_better = None
+        self.metric_to_watch = None
+        self.greater_train_metrics_is_better: Dict[str, bool] = {}  # For each metric, indicates if greater is better
+        self.greater_valid_metrics_is_better: Dict[str, bool] = {}
+
+        # Checkpoint Attributes
+        self.ckpt_root_dir = ckpt_root_dir
+        self.experiment_name = experiment_name
+        self.checkpoints_dir_path = None
+        self.load_checkpoint = False
+        self.ckpt_best_name = "ckpt_best.pth"
+
+        self.phase_callback_handler: CallbackHandler = None
+
+        # SET THE DEFAULTS
+        # TODO: SET DEFAULT TRAINING PARAMS FOR EACH TASK
+
+        default_results_titles = ["Train Loss", "Train Acc", "Train Top5", "Valid Loss", "Valid Acc", "Valid Top5"]
+
+        self.results_titles = default_results_titles
+
+        default_train_metrics, default_valid_metrics = MetricCollection([Accuracy(), Top5()]), MetricCollection(
+            [Accuracy(), Top5()])
+
+        self.train_metrics, self.valid_metrics = default_train_metrics, default_valid_metrics
+
+        self.train_monitored_values = {}
+        self.valid_monitored_values = {}
+        self.test_monitored_values = {}
+        self.max_train_batches = None
+        self.max_valid_batches = None
+
+        self._epoch_start_logging_values = {}
+        self._torch_lr_scheduler = None
+        self._pad_uneven_eval_batches = True
+
+    @property
+    def device(self) -> str:
+        return self.accelerator.device
+
+    @classmethod
+    def train_from_config(cls, cfg: Union[DictConfig, dict]) -> Tuple[nn.Module, Tuple]:
+        """
+        Trains according to cfg recipe configuration.
+
+        :param cfg: The parsed DictConfig from yaml recipe files or a dictionary
+        :return: the model and the output of trainer.train(...) (i.e results tuple)
+        """
+        # INSTANTIATE ALL OBJECTS IN CFG
+        cfg = hydra.utils.instantiate(cfg)
+
+        # TRIGGER CFG MODIFYING CALLBACKS
+        cfg = cls._trigger_cfg_modifying_callbacks(cfg)
+
+        trainer = Trainer(experiment_name=cfg.experiment_name, ckpt_root_dir=cfg.ckpt_root_dir,
+                          mixed_precision=cfg.training_hyperparams.mixed_precision,
+                          )
+
+        # BUILD NETWORK
+        model = models.get(
+            model_name=cfg.architecture,
+            num_classes=cfg.arch_params.num_classes,
+            arch_params=cfg.arch_params,
+            strict_load=cfg.checkpoint_params.strict_load,
+            pretrained_weights=cfg.checkpoint_params.pretrained_weights,
+            checkpoint_path=cfg.checkpoint_params.checkpoint_path,
+            load_backbone=cfg.checkpoint_params.load_backbone,
+            checkpoint_num_classes=get_param(cfg.checkpoint_params, "checkpoint_num_classes"),
+            num_input_channels=get_param(cfg.arch_params, "num_input_channels"),
+        )
+
+        # INSTANTIATE DATA LOADERS
+        train_dataloader = dataloaders.get(
+            name=get_param(cfg, "train_dataloader"),
+            dataset_params=cfg.dataset_params.train_dataset_params,
+            dataloader_params=cfg.dataset_params.train_dataloader_params,
+        )
+
+        val_dataloader = dataloaders.get(
+            name=get_param(cfg, "val_dataloader"),
+            dataset_params=cfg.dataset_params.val_dataset_params,
+            dataloader_params=cfg.dataset_params.val_dataloader_params,
+        )
+
+        test_loaders = maybe_instantiate_test_loaders(cfg)
+
+        recipe_logged_cfg = {"recipe_config": OmegaConf.to_container(cfg, resolve=True)}
+        # TRAIN
+        res = trainer.train(
+            model=model,
+            train_loader=train_dataloader,
+            valid_loader=val_dataloader,
+            test_loaders=test_loaders,
+            training_params=cfg.training_hyperparams,
+            additional_configs_to_log=recipe_logged_cfg,
+        )
+
+        return model, res
+
+    @classmethod
+    def _trigger_cfg_modifying_callbacks(cls, cfg):
+        pre_launch_cbs = get_param(cfg, "pre_launch_callbacks_list", list())
+        pre_launch_cbs = ListFactory(PreLaunchCallbacksFactory()).get(pre_launch_cbs)
+        for plcb in pre_launch_cbs:
+            cfg = plcb(cfg)
+        return cfg
+
+    @classmethod
+    def resume_experiment(cls, experiment_name: str, ckpt_root_dir: Optional[str] = None,
+                          run_id: Optional[str] = None) -> Tuple[nn.Module, Tuple]:
+        """
+        Resume a training that was run using our recipes.
+
+        :param experiment_name:     Name of the experiment to resume
+        :param ckpt_root_dir:       Directory including the checkpoints
+        :param run_id:              Optional. Run id of the experiment. If None, the most recent run will be loaded.
+        :return:                    The config that was used for that experiment
+        """
+        logger.info("Resume training using the checkpoint recipe, ignoring the current recipe")
+
+        if run_id is None:
+            run_id = get_latest_run_id(checkpoints_root_dir=ckpt_root_dir, experiment_name=experiment_name)
+
+        # Load the latest config
+        cfg = load_experiment_cfg(ckpt_root_dir=ckpt_root_dir, experiment_name=experiment_name, run_id=run_id)
+
+        add_params_to_cfg(cfg, params=["training_hyperparams.resume=True"])
+        if run_id:
+            add_params_to_cfg(cfg, params=[f"training_hyperparams.run_id={run_id}"])
+        return cls.train_from_config(cfg)
+
+    @classmethod
+    def evaluate_from_recipe(cls, cfg: DictConfig) -> Tuple[nn.Module, Tuple]:
+        """
+        Evaluate according to a cfg recipe configuration.
+
+        Note:   This script does NOT run training, only validation.
+                Please make sure that the config refers to a PRETRAINED MODEL either from one of your checkpoint or from pretrained weights from model zoo.
+        :param cfg: The parsed DictConfig from yaml recipe files or a dictionary
+        """
+        # INSTANTIATE ALL OBJECTS IN CFG
+        cfg = hydra.utils.instantiate(cfg)
+
+        trainer = Trainer(experiment_name=cfg.experiment_name, ckpt_root_dir=cfg.ckpt_root_dir)
+
+        # INSTANTIATE DATA LOADERS
+        val_dataloader = dataloaders.get(
+            name=cfg.val_dataloader, dataset_params=cfg.dataset_params.val_dataset_params,
+            dataloader_params=cfg.dataset_params.val_dataloader_params
+        )
+
+        if cfg.checkpoint_params.checkpoint_path is None:
+            logger.info(
+                "`checkpoint_params.checkpoint_path` was not provided. The recipe will be evaluated using checkpoints_dir.training_hyperparams.ckpt_name"
+            )
+
+            eval_run_id = core_utils.get_param(cfg, "training_hyperparams.run_id", None)
+            if eval_run_id is None:
+                logger.info("`training_hyperparams.run_id` was not provided. Evaluating the latest run.")
+                eval_run_id = get_latest_run_id(checkpoints_root_dir=cfg.ckpt_root_dir,
+                                                experiment_name=cfg.experiment_name)
+                # NOTE: `eval_run_id` will be None if no latest run directory was found.
+
+            # NOTE: If eval_run_id is None here, the checkpoint directory will be ckpt_root_dir/experiment_name.
+            # This ensures backward compatibility with `super-gradients<=3.1.2` which did not include one directory per run.
+            checkpoints_dir = get_checkpoints_dir_path(experiment_name=cfg.experiment_name,
+                                                       ckpt_root_dir=cfg.ckpt_root_dir, run_id=eval_run_id)
+            checkpoint_path = os.path.join(checkpoints_dir, cfg.training_hyperparams.ckpt_name)
+            if os.path.exists(checkpoint_path):
+                cfg.checkpoint_params.checkpoint_path = checkpoint_path
+
+        logger.info(f"Evaluating checkpoint: {cfg.checkpoint_params.checkpoint_path}")
+
+        # BUILD NETWORK
+        model = models.get(
+            model_name=cfg.architecture,
+            num_classes=cfg.arch_params.num_classes,
+            arch_params=cfg.arch_params,
+            strict_load=cfg.checkpoint_params.strict_load,
+            pretrained_weights=cfg.checkpoint_params.pretrained_weights,
+            checkpoint_path=cfg.checkpoint_params.checkpoint_path,
+            load_backbone=cfg.checkpoint_params.load_backbone,
+            checkpoint_num_classes=get_param(cfg.checkpoint_params, "checkpoint_num_classes"),
+            num_input_channels=get_param(cfg.arch_params, "num_input_channels"),
+        )
+
+        # TEST
+        valid_metrics_dict = trainer.test(model=model, test_loader=val_dataloader,
+                                          test_metrics_list=cfg.training_hyperparams.valid_metrics_list)
+
+        results = ["Validate Results"]
+        results += [f"   - {metric:10}: {value}" for metric, value in valid_metrics_dict.items()]
+        logger.info("\n".join(results))
+
+        return model, valid_metrics_dict
+
+    @classmethod
+    def evaluate_checkpoint(
+            cls,
+            experiment_name: str,
+            ckpt_name: str = "ckpt_latest.pth",
+            ckpt_root_dir: Optional[str] = None,
+            run_id: Optional[str] = None,
+    ) -> None:
+        """
+        Evaluate a checkpoint resulting from one of your previous experiment, using the same parameters (dataset, valid_metrics,...)
+        as used during the training of the experiment
+
+        Note:
+            The parameters will be unchanged even if the recipe used for that experiment was changed since then.
+            This is to ensure that validation of the experiment will remain exactly the same as during training.
+
+        Example, evaluate the checkpoint "average_model.pth" from experiment "my_experiment_name":
+            >> evaluate_checkpoint(experiment_name="my_experiment_name", ckpt_name="average_model.pth")
+
+        :param experiment_name:     Name of the experiment to validate
+        :param ckpt_name:           Name of the checkpoint to test ("ckpt_latest.pth", "average_model.pth" or "ckpt_best.pth" for instance)
+        :param ckpt_root_dir:       Optional. Directory including the checkpoints
+        :param run_id:              Optional. Run id of the experiment. If None, the most recent run will be loaded.
+        :return:                    The config that was used for that experiment
+        """
+        logger.info("Evaluate checkpoint")
+
+        if run_id is None:
+            run_id = get_latest_run_id(checkpoints_root_dir=ckpt_root_dir, experiment_name=experiment_name)
+
+        # Load the latest config
+        cfg = load_experiment_cfg(ckpt_root_dir=ckpt_root_dir, experiment_name=experiment_name, run_id=run_id)
+
+        add_params_to_cfg(cfg, params=["training_hyperparams.resume=True", f"ckpt_name={ckpt_name}"])
+        cls.evaluate_from_recipe(cfg)
+
+    def _train_epoch(self, context: PhaseContext, silent_mode: bool = False) -> tuple:
+        """
+        train_epoch - A single epoch training procedure
+            :param optimizer:   The optimizer for the network
+            :param epoch:       The current epoch
+            :param silent_mode: No verbosity
+        """
+        # SET THE MODEL IN training STATE
+        self.net.train()
+        self.criterion.train()
+
+        expected_iterations = len(self.train_loader) if self.max_train_batches is None else self.max_train_batches
+
+        # THE DISABLE FLAG CONTROLS WHETHER THE PROGRESS BAR IS SILENT OR PRINTS THE LOGS
+        with tqdm(self.train_loader, total=expected_iterations, bar_format="{l_bar}{bar:10}{r_bar}", dynamic_ncols=True,
+                  disable=silent_mode
+                  ) as progress_bar_train_loader:
+            progress_bar_train_loader.set_description(f"Train epoch {context.epoch}")
+
+            # RESET/INIT THE METRIC LOGGERS
+            self._reset_metrics()
+
+            self.train_metrics.to(self.accelerator.device)
+            loss_avg_meter = core_utils.utils.AverageMeter()
+
+            context.update_context(loss_avg_meter=loss_avg_meter, metrics_compute_fn=self.train_metrics)
+
+            for batch_idx, batch_items in enumerate(progress_bar_train_loader):
+                if expected_iterations <= batch_idx:
+                    break
+
+                inputs, targets, additional_batch_items = sg_trainer_utils.unpack_batch_items(batch_items)
+
+                if self.pre_prediction_callback is not None:
+                    inputs, targets = self.pre_prediction_callback(inputs, targets, batch_idx)
+
+                context.update_context(
+                    batch_idx=batch_idx, inputs=inputs, target=targets, additional_batch_items=additional_batch_items,
+                    **additional_batch_items
+                )
+                self.phase_callback_handler.on_train_batch_start(context)
+
+                outputs = self.net(inputs)
+                loss, loss_log_items = self._get_losses(outputs, targets)
+
+                context.update_context(preds=outputs, loss_log_items=loss_log_items,
+                                       loss_logging_items_names=self.loss_logging_items_names)
+                self.phase_callback_handler.on_train_batch_loss_end(context)
+
+                if not self.ddp_silent_mode and batch_idx == 0:
+                    self._epoch_start_logging_values = self._get_epoch_start_logging_values()
+
+                self._backward_step(loss, context.epoch, batch_idx, context)
+
+                # COMPUTE THE RUNNING USER METRICS AND LOSS RUNNING ITEMS. RESULT TUPLE IS THEIR CONCATENATION.
+                logging_values = loss_avg_meter.average + get_metrics_results_tuple(self.train_metrics)
+                gpu_memory_utilization = get_gpu_mem_utilization() / 1e9 if torch.cuda.is_available() else 0
+
+                # RENDER METRICS PROGRESS
+                pbar_message_dict = get_train_loop_description_dict(
+                    logging_values, self.train_metrics, self.loss_logging_items_names, gpu_mem=gpu_memory_utilization
+                )
+
+                progress_bar_train_loader.set_postfix(**pbar_message_dict)
+                self.phase_callback_handler.on_train_batch_end(context)
+
+            self.train_monitored_values = sg_trainer_utils.update_monitored_values_dict(
+                monitored_values_dict=self.train_monitored_values, new_values_dict=pbar_message_dict
+            )
+
+        return logging_values
+
+    def _get_losses(self, outputs: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, tuple]:
+        # GET THE OUTPUT OF THE LOSS FUNCTION
+        loss = self.criterion(outputs, targets)
+        if isinstance(loss, tuple):
+            loss, loss_logging_items = loss
+            # IF ITS NOT A TUPLE THE LOGGING ITEMS CONTAIN ONLY THE LOSS FOR BACKPROP (USER DEFINED LOSS RETURNS SCALAR)
+        else:
+            loss_logging_items = loss.unsqueeze(0).detach()
+
+        # ON FIRST BACKWARD, DERRIVE THE LOGGING TITLES.
+        if self.loss_logging_items_names is None or self._first_backward:
+            self._init_loss_logging_names(loss_logging_items)
+            if self.metric_to_watch:
+                self._init_monitored_items()
+            self._first_backward = False
+
+        if len(loss_logging_items) != len(self.loss_logging_items_names):
+            raise ValueError(
+                "Loss output length must match loss_logging_items_names. Got "
+                + str(len(loss_logging_items))
+                + ", and "
+                + str(len(self.loss_logging_items_names))
+            )
+        # RETURN AND THE LOSS LOGGING ITEMS COMPUTED DURING LOSS FORWARD PASS
+        return loss, loss_logging_items
+
+    def _init_monitored_items(self):
+        # Instantiate the values to monitor (loss/metric)
+        for loss_name in self.loss_logging_items_names:
+            self.train_monitored_values[loss_name] = MonitoredValue(name=loss_name, greater_is_better=False)
+            self.valid_monitored_values[loss_name] = MonitoredValue(name=loss_name, greater_is_better=False)
+
+        for metric_name in get_metrics_titles(self.train_metrics):
+            self.train_monitored_values[metric_name] = MonitoredValue(
+                name=metric_name,
+                greater_is_better=self.greater_train_metrics_is_better.get(metric_name)
+            )
+
+        for metric_name in get_metrics_titles(self.valid_metrics):
+            self.valid_monitored_values[metric_name] = MonitoredValue(
+                name=metric_name,
+                greater_is_better=self.greater_valid_metrics_is_better.get(metric_name)
+            )
+
+        for dataset_name in self.test_loaders.keys():
+            for loss_name in self.loss_logging_items_names:
+                loss_full_name = f"{dataset_name}:{loss_name}" if dataset_name else loss_name
+                self.test_monitored_values[loss_full_name] = MonitoredValue(
+                    name=f"{dataset_name}:{loss_name}",
+                    greater_is_better=False,
+                )
+            for metric_name in get_metrics_titles(self.test_metrics):
+                metric_full_name = f"{dataset_name}:{metric_name}" if dataset_name else metric_name
+                self.test_monitored_values[metric_full_name] = MonitoredValue(
+                    name=metric_full_name,
+                    greater_is_better=self.greater_valid_metrics_is_better.get(metric_name),
+                )
+
+        # make sure the metric_to_watch is an exact match
+        metric_titles = self.loss_logging_items_names + get_metrics_titles(self.valid_metrics)
+        try:
+            metric_to_watch_idx = fuzzy_idx_in_list(self.metric_to_watch, metric_titles)
+        except IndexError:
+            raise ValueError(
+                f"No match found for `metric_to_watch={self.metric_to_watch}`. Available metrics to monitor are: `{metric_titles}`.")
+
+        metric_to_watch = metric_titles[metric_to_watch_idx]
+        if metric_to_watch != self.metric_to_watch:
+            logger.warning(
+                f"No exact match found for `metric_to_watch={self.metric_to_watch}`. Available metrics to monitor are: `{metric_titles}`. \n"
+                f"`metric_to_watch={metric_to_watch} will be used instead.`"
+            )
+            self.metric_to_watch = metric_to_watch
+
+        if self.training_params.average_best_models:
+            self.model_weight_averaging = ModelWeightAveraging(
+                ckpt_dir=self.checkpoints_dir_path,
+                greater_is_better=self.greater_metric_to_watch_is_better,
+                metric_to_watch=self.metric_to_watch,
+                load_checkpoint=self.load_checkpoint,
+            )
+
+    def _backward_step(self, loss: torch.Tensor, epoch: int, batch_idx: int, context: PhaseContext, *args,
+                       **kwargs) -> None:
+        """
+        Run backprop on the loss and perform a step
+        :param loss: The value computed by the loss function
+        :param optimizer: An object that can perform a gradient step and zeroize model gradient
+        :param epoch: number of epoch the training is on
+        :param batch_idx: Zero-based number of iteration inside the current epoch
+        :param context: current phase context
+        :return:
+        """
+        # SCALER IS ENABLED ONLY IF self.training_params.mixed_precision=True
+        self.accelerator.backward(loss)
+        self.phase_callback_handler.on_train_batch_backward_end(context)
+
+        # ACCUMULATE GRADIENT FOR X BATCHES BEFORE OPTIMIZING
+        local_step = batch_idx + 1
+        global_step = local_step + len(self.train_loader) * epoch
+        total_steps = len(self.train_loader) * self.max_epochs
+
+        if global_step % self.batch_accumulate == 0:
+            self.phase_callback_handler.on_train_batch_gradient_step_start(context)
+
+            # APPLY GRADIENT CLIPPING IF REQUIRED
+            if self.training_params.clip_grad_norm and self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(parameters=self.net.parameters(),
+                                                 max_norm=self.training_params.clip_grad_norm)
+
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            if self.ema:
+                self.ema_model.update(self.net, step=global_step, total_steps=total_steps)
+
+            # RUN PHASE CALLBACKS
+            self.phase_callback_handler.on_train_batch_gradient_step_end(context)
+
+    def _save_checkpoint(
+            self,
+            optimizer: torch.optim.Optimizer = None,
+            epoch: int = None,
+            train_metrics_dict: Optional[Dict[str, float]] = None,
+            validation_results_dict: Optional[Dict[str, float]] = None,
+            context: PhaseContext = None,
+    ) -> None:
+        """
+        Save the current state dict as latest (always), best (if metric was improved), epoch# (if determined in training
+        params)
+        """
+        # WHEN THE validation_results_tuple IS NONE WE SIMPLY SAVE THE state_dict AS LATEST AND Return
+        if validation_results_dict is None:
+            self.sg_logger.add_checkpoint(tag="ckpt_latest_weights_only.pth", state_dict={"net": self.net.state_dict()},
+                                          global_step=epoch)
+            return
+
+        # COMPUTE THE CURRENT metric
+        # IF idx IS A LIST - SUM ALL THE VALUES STORED IN THE LIST'S INDICES
+        curr_tracked_metric = float(validation_results_dict[self.metric_to_watch])
+
+        # create metrics dict to save
+        valid_metrics_titles = get_metrics_titles(self.valid_metrics)
+
+        all_metrics = {
+            "tracked_metric_name": self.metric_to_watch,
+            "valid": {metric_name: float(validation_results_dict[metric_name]) for metric_name in valid_metrics_titles},
+        }
+
+        if train_metrics_dict is not None:
+            train_metrics_titles = get_metrics_titles(self.train_metrics)
+            all_metrics["train"] = {metric_name: float(train_metrics_dict[metric_name]) for metric_name in
+                                    train_metrics_titles}
+
+        # BUILD THE state_dict
+        state = {
+            "net": self.accelerator.unwrap_model(self.net).state_dict(),
+            "acc": curr_tracked_metric,
+            "epoch": epoch,
+            "metrics": all_metrics,
+            "packages": get_installed_packages(),
+        }
+
+        if optimizer is not None:
+            state["optimizer_state_dict"] = optimizer.state_dict()
+
+        if self.accelerator.scaler is not None:
+            state["scaler_state_dict"] = self.accelerator.scaler.state_dict()
+
+        if self.ema:
+            state["ema_net"] = self.accelerator.unwrap_model(self.ema_model.ema).state_dict()
+
+        processing_params = self._get_preprocessing_from_valid_loader()
+        if processing_params is not None:
+            state["processing_params"] = processing_params
+
+        if self._torch_lr_scheduler is not None:
+            state["torch_scheduler_state_dict"] = get_scheduler_state(self._torch_lr_scheduler)
+
+        # SAVES CURRENT MODEL AS ckpt_latest
+        self.sg_logger.add_checkpoint(tag="ckpt_latest.pth", state_dict=state, global_step=epoch)
+
+        # SAVE MODEL AT SPECIFIC EPOCHS DETERMINED BY save_ckpt_epoch_list
+        if epoch in self.training_params.save_ckpt_epoch_list:
+            self.sg_logger.add_checkpoint(tag=f"ckpt_epoch_{epoch}.pth", state_dict=state, global_step=epoch)
+
+        # OVERRIDE THE BEST CHECKPOINT AND best_metric IF metric GOT BETTER THAN THE PREVIOUS BEST
+        if (curr_tracked_metric > self.best_metric and self.greater_metric_to_watch_is_better) or (
+                curr_tracked_metric < self.best_metric and not self.greater_metric_to_watch_is_better
+        ):
+            # STORE THE CURRENT metric AS BEST
+            self.best_metric = curr_tracked_metric
+            self.sg_logger.add_checkpoint(tag=self.ckpt_best_name, state_dict=state, global_step=epoch)
+
+            # RUN PHASE CALLBACKS
+            self.phase_callback_handler.on_validation_end_best_epoch(context)
+            logger.info(
+                "Best checkpoint overriden: validation " + self.metric_to_watch + ": " + str(curr_tracked_metric))
+
+        if self.training_params.average_best_models:
+            net_for_averaging = self.accelerator.unwrap_model(self.ema_model.ema if self.ema else self.net)
+            state["net"] = self.model_weight_averaging.get_average_model(
+                net_for_averaging, validation_results_dict=validation_results_dict
+            )
+            # REMOVE UNNECESSARY ITEMS FROM AVERAGED STATE DICT
+            for key_to_remove in ["optimizer_state_dict", "scaler_state_dict", "ema_net"]:
+                _ = state.pop(key_to_remove, None)
+            self.sg_logger.add_checkpoint(tag=self.average_model_checkpoint_filename, state_dict=state,
+                                          global_step=epoch)
+
+    def _prep_net_for_train(self) -> None:
+        if self.arch_params is None:
+            self._init_arch_params()
+
+        # TODO: REMOVE THE BELOW LINE (FOR BACKWARD COMPATIBILITY)
+        if self.checkpoint_params is None:
+            self.checkpoint_params = HpmStruct(load_checkpoint=self.training_params.resume)
+
+        # FOR MULTI-GPU TRAINING (not distributed)
+        sync_bn = core_utils.get_param(self.training_params, "sync_bn", default_val=False)
+        if sync_bn:
+            if not self.ddp_silent_mode:
+                logger.info("DDP - Using Sync Batch Norm... Training time will be affected accordingly")
+            self.net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.net)
+
+        self.net = self.accelerator.prepare_model(self.net)
+
+        # SET THE FLAG FOR DIFFERENT PARAMETER GROUP OPTIMIZER UPDATE
+        self.update_param_groups = hasattr(self.accelerator.unwrap_model(self.net), "update_param_groups")
+
+    def _init_arch_params(self) -> None:
+        default_arch_params = HpmStruct()
+        arch_params = getattr(self.net, "arch_params", default_arch_params)
+        self.arch_params = default_arch_params
+        if arch_params is not None:
+            self.arch_params.override(**arch_params.to_dict())
+
+    def _should_run_validation_for_epoch(self, epoch: int) -> bool:
+        """
+        Method returns true if the validation should to be calculated on this epoch (starting from 0).
+
+        We need to calculate validation if
+        1) the epoch is divisible by #run_validation_freq
+        2) if epoch is last
+        3) if epoch is in self.save_ckpt_epoch_list
+        """
+
+        is_run_val_freq_divisible = ((epoch + 1) % self.run_validation_freq) == 0
+        is_last_epoch = (epoch + 1) == self.max_epochs
+        is_in_checkpoint_list = (epoch + 1) in self.training_params.save_ckpt_epoch_list
+
+        return is_run_val_freq_divisible or is_last_epoch or is_in_checkpoint_list
+
+    # FIXME - we need to resolve flake8's 'function is too complex' for this function
+    def train(
+            self,
+            model: nn.Module,
+            training_params: dict = None,
+            train_loader: DataLoader = None,
+            valid_loader: DataLoader = None,
+            test_loaders: Dict[str, DataLoader] = None,
+            additional_configs_to_log: Dict = None,
+    ):  # noqa: C901
+        """
+
+        train - Trains the Model
+
+        IMPORTANT NOTE: Additional batch parameters can be added as a third item (optional) if a tuple is returned by
+          the data loaders, as dictionary. The phase context will hold the additional items, under an attribute with
+          the same name as the key in this dictionary. Then such items can be accessed through phase callbacks.
+
+            :param additional_configs_to_log: Dict, dictionary containing configs that will be added to the training's
+                sg_logger. Format should be {"Config_title_1": {...}, "Config_title_2":{..}}.
+            :param model: torch.nn.Module, model to train.
+
+            :param train_loader: Dataloader for train set.
+            :param valid_loader: Dataloader for validation.
+            :param test_loaders: Dictionary of test loaders. The key will be used as the dataset name.
+            :param training_params:
+
+                - `resume` : bool (default=False)
+
+                    Whether to continue training from ckpt with the same experiment name
+                     (i.e resume from CKPT_ROOT_DIR/EXPERIMENT_NAME/CKPT_NAME)
+
+                - `run_id` : (Optional) int (default=None)
+
+                    ID of run to resume from the same experiment. When set, the training will be resumed from the checkpoint in the specified run id.
+
+                - `ckpt_name` : str (default=ckpt_latest.pth)
+
+                    The checkpoint (.pth file) filename in CKPT_ROOT_DIR/EXPERIMENT_NAME/ to use when resume=True and
+                     resume_path=None
+
+                - `resume_path`: str (default=None)
+
+                    Explicit checkpoint path (.pth file) to use to resume training.
+
+                - `max_epochs` : int
+
+                    Number of epochs to run training.
+
+                - `lr_updates` : list(int)
+
+                    List of fixed epoch numbers to perform learning rate updates when `lr_mode='StepLRScheduler'`.
+
+                - `lr_decay_factor` : float
+
+                    Decay factor to apply to the learning rate at each update when `lr_mode='StepLRScheduler'`.
+
+
+                -  `lr_mode` : Union[str, Mapping],
+
+                    When str:
+
+                    Learning rate scheduling policy, one of ['StepLRScheduler','PolyLRScheduler','CosineLRScheduler','FunctionLRScheduler'].
+
+                    'StepLRScheduler' refers to constant updates at epoch numbers passed through `lr_updates`.
+                        Each update decays the learning rate by `lr_decay_factor`.
+
+                    'CosineLRScheduler' refers to the Cosine Anealing policy as mentioned in https://arxiv.org/abs/1608.03983.
+                      The final learning rate ratio is controlled by `cosine_final_lr_ratio` training parameter.
+
+                    'PolyLRScheduler' refers to the polynomial decrease:
+                        in each epoch iteration `self.lr = self.initial_lr * pow((1.0 - (current_iter / max_iter)), 0.9)`
+
+                    'FunctionLRScheduler' refers to a user-defined learning rate scheduling function, that is passed through `lr_schedule_function`.
+
+
+
+                    When Mapping, refers to a torch.optim.lr_scheduler._LRScheduler, following the below API:
+
+                        lr_mode = {LR_SCHEDULER_CLASS_NAME: {**LR_SCHEDULER_KWARGS, "phase": XXX, "metric_name": XXX)
+
+                        Where "phase" (of Phase type) controls when to call torch.optim.lr_scheduler._LRScheduler.step().
+
+                        The "metric_name" refers to the metric to watch (See docs for "metric_to_watch" in train(...)
+                         https://docs.deci.ai/super-gradients/docstring/training/sg_trainer.html) when using
+                          ReduceLROnPlateau. In any other case this kwarg is ignored.
+
+                        **LR_SCHEDULER_KWARGS are simply passed to the torch scheduler's __init__.
+
+
+                        For example:
+                            lr_mode = {"StepLR": {"gamma": 0.1, "step_size": 1, "phase": Phase.TRAIN_EPOCH_END}}
+                            is equivalent to following training code:
+
+                                from torch.optim.lr_scheduler import StepLR
+                                ...
+                                optimizer = ....
+                                scheduler = StepLR(optimizer=optimizer, gamma=0.1, step_size=1)
+
+                                for epoch in num_epochs:
+                                    train_epoch(...)
+                                    scheduler.step()
+                                    ....
+
+
+
+                - `lr_schedule_function` : Union[callable,None]
+
+                    Learning rate scheduling function to be used when `lr_mode` is 'FunctionLRScheduler'.
+
+                - `warmup_mode`: Union[str, Type[LRCallbackBase], None]
+
+                    If not None, define how the learning rate will be increased during the warmup phase.
+                    Currently, only 'warmup_linear_epoch' and `warmup_linear_step` modes are supported.
+
+                - `lr_warmup_epochs` : int (default=0)
+
+                    Number of epochs for learning rate warm up - see https://arxiv.org/pdf/1706.02677.pdf (Section 2.2).
+                    Relevant for `warmup_mode=warmup_linear_epoch`.
+                    When lr_warmup_epochs > 0, the learning rate will be increased linearly from 0 to the `initial_lr`
+                    once per epoch.
+
+                - `lr_warmup_steps` : int (default=0)
+
+                    Number of steps for learning rate warm up - see https://arxiv.org/pdf/1706.02677.pdf (Section 2.2).
+                    Relevant for `warmup_mode=warmup_linear_step`.
+                    When lr_warmup_steps > 0, the learning rate will be increased linearly from 0 to the `initial_lr`
+                    for a total number of steps according to formula: min(lr_warmup_steps, len(train_loader)).
+                    The capping is done to avoid interference of warmup with epoch-based schedulers.
+
+                - `cosine_final_lr_ratio` : float (default=0.01)
+                    Final learning rate ratio (only relevant when `lr_mode`='CosineLRScheduler'). The cosine starts from initial_lr and reaches
+                     initial_lr * cosine_final_lr_ratio in last epoch
+
+                - `inital_lr` : Union[float, Dict[str, float]
+
+                    Initial learning rate as:
+                    float - learning rate value when passed as a scalar
+                    Dictionary where keys are group names and values are the learning rates.
+                    For example {"default": 0.01, "head": 0.1}
+
+                    - Keys in such mapping are prefixes of named parameters of the model.
+                    - The "default" key is mandatory, and it's lr value is set for any group not specified in the other keys
+                    - It is also possible to freeze some parts of the model by assigning 0 as a lr value.
+
+                - `loss` : Union[nn.module, str]
+
+                    Loss function for training.
+                    One of SuperGradient's built in options:
+
+                        - CrossEntropyLoss,
+                        - MSELoss,
+                        - RSquaredLoss,
+                        - YoLoV3DetectionLoss,
+                        - ShelfNetOHEMLoss,
+                        - ShelfNetSemanticEncodingLoss,
+                        - SSDLoss,
+
+
+                    or user defined nn.module loss function.
+
+                    IMPORTANT: forward(...) should return a (loss, loss_items) tuple where loss is the tensor used
+                    for backprop (i.e what your original loss function returns), and loss_items should be a tensor of
+                    shape (n_items), of values computed during the forward pass which we desire to log over the
+                    entire epoch. For example- the loss itself should always be logged. Another example is a scenario
+                    where the computed loss is the sum of a few components we would like to log- these entries in
+                    loss_items).
+
+                    IMPORTANT:When dealing with external loss classes, to logg/monitor the loss_items as described
+                    above by specific string name:
+
+                    Set a "component_names" property in the loss class, whos instance is passed through train_params,
+                     to be a list of strings, of length n_items who's ith element is the name of the ith entry in loss_items.
+                     Then each item will be logged, rendered on tensorboard and "watched" (i.e saving model checkpoints
+                     according to it) under <LOSS_CLASS.__name__>"/"<COMPONENT_NAME>. If a single item is returned rather then a
+                     tuple, it would be logged under <LOSS_CLASS.__name__>. When there is no such attributed, the items
+                     will be named <LOSS_CLASS.__name__>"/"Loss_"<IDX> according to the length of loss_items
+
+                    For example:
+                        class MyLoss(_Loss):
+                            ...
+                            def forward(self, inputs, targets):
+                                ...
+                                total_loss = comp1 + comp2
+                                loss_items = torch.cat((total_loss.unsqueeze(0),comp1.unsqueeze(0), comp2.unsqueeze(0)).detach()
+                                return total_loss, loss_items
+                            ...
+                            @property
+                            def component_names(self):
+                                return ["total_loss", "my_1st_component", "my_2nd_component"]
+
+                    Trainer.train(...
+                                    train_params={"loss":MyLoss(),
+                                                    ...
+                                                    "metric_to_watch": "MyLoss/my_1st_component"}
+
+                        This will write to log and monitor MyLoss/total_loss, MyLoss/my_1st_component,
+                         MyLoss/my_2nd_component.
+
+                   For example:
+                        class MyLoss2(_Loss):
+                            ...
+                            def forward(self, inputs, targets):
+                                ...
+                                total_loss = comp1 + comp2
+                                loss_items = torch.cat((total_loss.unsqueeze(0),comp1.unsqueeze(0), comp2.unsqueeze(0)).detach()
+                                return total_loss, loss_items
+                            ...
+
+                    Trainer.train(...
+                                    train_params={"loss":MyLoss(),
+                                                    ...
+                                                    "metric_to_watch": "MyLoss2/loss_0"}
+
+                        This will write to log and monitor MyLoss2/loss_0, MyLoss2/loss_1, MyLoss2/loss_2
+                        as they have been named by their positional index in loss_items.
+
+                    Since running logs will save the loss_items in some internal state, it is recommended that
+                    loss_items are detached from their computational graph for memory efficiency.
+
+                - `optimizer` : Union[str, torch.optim.Optimizer]
+
+                    Optimization algorithm. One of ['Adam','SGD','RMSProp'] corresponding to the torch.optim
+                    optimzers implementations, or any object that implements torch.optim.Optimizer.
+
+                - `criterion_params` : dict
+
+                    Loss function parameters.
+
+                - `optimizer_params` : dict
+                    When `optimizer` is one of ['Adam','SGD','RMSProp'], it will be initialized with optimizer_params.
+
+                    (see https://pytorch.org/docs/stable/optim.html for the full list of
+                    parameters for each optimizer).
+
+                - `train_metrics_list` : list(torchmetrics.Metric)
+
+                    Metrics to log during training. For more information on torchmetrics see
+                    https://torchmetrics.rtfd.io/en/latest/.
+
+
+                - `valid_metrics_list` : list(torchmetrics.Metric)
+
+                    Metrics to log during validation/testing. For more information on torchmetrics see
+                    https://torchmetrics.rtfd.io/en/latest/.
+
+
+                - `loss_logging_items_names` : list(str)
+
+                    The list of names/titles for the outputs returned from the loss functions forward pass (reminder-
+                    the loss function should return the tuple (loss, loss_items)). These names will be used for
+                    logging their values.
+
+                - `metric_to_watch` : str (default="Accuracy")
+
+                    will be the metric which the model checkpoint will be saved according to, and can be set to any
+                    of the following:
+
+                        a metric name (str) of one of the metric objects from the valid_metrics_list
+
+                        a "metric_name" if some metric in valid_metrics_list has an attribute component_names which
+                        is a list referring to the names of each entry in the output metric (torch tensor of size n)
+
+                        one of "loss_logging_items_names" i.e which will correspond to an item returned during the
+                        loss function's forward pass (see loss docs abov).
+
+                    At the end of each epoch, if a new best metric_to_watch value is achieved, the models checkpoint
+                    is saved in YOUR_PYTHON_PATH/checkpoints/ckpt_best.pth
+
+                - `greater_metric_to_watch_is_better` : bool
+
+                    When choosing a model's checkpoint to be saved, the best achieved model is the one that maximizes the
+                     metric_to_watch when this parameter is set to True, and a one that minimizes it otherwise.
+
+                - `ema` : bool (default=False)
+
+                    Whether to use Model Exponential Moving Average (see
+                    https://github.com/rwightman/pytorch-image-models ema implementation)
+
+                - `batch_accumulate` : int (default=1)
+
+                    Number of batches to accumulate before every backward pass.
+
+                - `ema_params` : dict
+
+                    Parameters for the ema model.
+
+                - `zero_weight_decay_on_bias_and_bn` : bool (default=False)
+
+                    Whether to apply weight decay on batch normalization parameters or not (ignored when the passed
+                    optimizer has already been initialized).
+
+
+                - `load_opt_params` : bool (default=True)
+
+                    Whether to load the optimizers parameters as well when loading a model's checkpoint.
+
+                - `run_validation_freq` : int (default=1)
+
+                    The frequency in which validation is performed during training (i.e the validation is ran every
+                     `run_validation_freq` epochs). Also applies to test set if you provided one.
+
+                - `run_test_freq` : int (default=1)
+
+                    The frequency in which test is performed during training (i.e the test is ran every
+                     `run_test_freq` epochs). Only applies if you provided a test set.
+
+                - `save_model` : bool (default=True)
+
+                    Whether to save the model checkpoints.
+
+                - `silent_mode` : bool
+
+                    Silents the print outs.
+
+                - `mixed_precision` : bool
+
+                    Whether to use mixed precision or not.
+
+                - `save_ckpt_epoch_list` : list(int) (default=[])
+
+                    List of fixed epoch indices the user wishes to save checkpoints in.
+
+                - `average_best_models` : bool (default=False)
+
+                    If set, a snapshot dictionary file and the average model will be saved / updated at every epoch
+                    and evaluated only when training is completed. The snapshot file will only be deleted upon
+                    completing the training. The snapshot dict will be managed on cpu.
+
+                - `precise_bn` : bool (default=False)
+
+                    Whether to use precise_bn calculation during the training.
+
+                - `precise_bn_batch_size` : int (default=None)
+
+                    The effective batch size we want to calculate the batchnorm on. For example, if we are training a model
+                    on 8 gpus, with a batch of 128 on each gpu, a good rule of thumb would be to give it 8192
+                    (ie: effective_batch_size * num_gpus = batch_per_gpu * num_gpus * num_gpus).
+                    If precise_bn_batch_size is not provided in the training_params, the latter heuristic will be taken.
+
+                - `seed` : int (default=42)
+
+                    Random seed to be set for torch, numpy, and random. When using DDP each process will have it's seed
+                    set to seed + rank.
+
+
+                - `log_installed_packages` : bool (default=False)
+
+                    When set, the list of all installed packages (and their versions) will be written to the tensorboard
+                     and logfile (useful when trying to reproduce results).
+
+                - `dataset_statistics` : bool (default=False)
+
+                    Enable a statistic analysis of the dataset. If set to True the dataset will be analyzed and a report
+                    will be added to the tensorboard along with some sample images from the dataset. Currently only
+                    detection datasets are supported for analysis.
+
+                -  `sg_logger` : Union[AbstractSGLogger, str] (defauls=base_sg_logger)
+
+                    Define the SGLogger object for this training process. The SGLogger handles all disk writes, logs, TensorBoard, remote logging
+                    and remote storage. By overriding the default base_sg_logger, you can change the storage location, support external monitoring and logging
+                    or support remote storage.
+
+                -   `sg_logger_params` : dict
+
+                    SGLogger parameters
+
+                -   `clip_grad_norm` : float
+
+                    Defines a maximal L2 norm of the gradients. Values which exceed the given value will be clipped
+
+                -   `lr_cooldown_epochs` : int (default=0)
+
+                    Number of epochs to cooldown LR (i.e the last epoch from scheduling view point=max_epochs-cooldown).
+
+                -   `pre_prediction_callback` : Callable (default=None)
+
+                     When not None, this callback will be applied to images and targets, and returning them to be used
+                      for the forward pass, and further computations. Args for this callable should be in the order
+                      (inputs, targets, batch_idx) returning modified_inputs, modified_targets
+
+                -   `ckpt_best_name` : str (default='ckpt_best.pth')
+
+                    The best checkpoint (according to metric_to_watch) will be saved under this filename in the checkpoints directory.
+
+                -   `max_train_batches`: int, for debug- when not None- will break out of inner train loop (i.e iterating over
+                      train_loader) when reaching this number of batches. Usefull for debugging (default=None).
+
+                -   `max_valid_batches`: int, for debug- when not None- will break out of inner valid loop (i.e iterating over
+                      valid_loader) when reaching this number of batches. Usefull for debugging (default=None).
+
+                -   `resume_from_remote_sg_logger`: bool (default=False),  bool (default=False), When true, ckpt_name (checkpoint filename
+                       to resume i.e ckpt_latest.pth bydefault) will be downloaded into the experiment checkpoints directory
+                       prior to loading weights, then training is resumed from that checkpoint. The source is unique to
+                       every logger, and currently supported for WandB loggers only.
+
+                       IMPORTANT: Only works for experiments that were ran with sg_logger_params.save_checkpoints_remote=True.
+                       IMPORTANT: For WandB loggers, one must also pass the run id through the wandb_id arg in sg_logger_params.
+
+                -   `finetune`: bool (default=False)
+
+                     Whether to freeze a fixed part of the model. Supported only for models that implement get_finetune_lr_dict.
+                      The model's class method get_finetune_lr_dict should return a dictionary, mapping lr to the
+                      unfrozen part of the network, in the same fashion as using initial_lr.
+
+                      For example:
+                        def get_finetune_lr_dict(self, lr: float) -> Dict[str, float]:
+                            return {"default": 0, "head": lr}
+
+                        Will raise an error if initial_lr is a mapping already.
+
+
+
+
+        :return:
+        """
+
+        global logger
+        if training_params is None:
+            training_params = dict()
+
+        self.train_loader = train_loader if train_loader is not None else self.train_loader
+        self.valid_loader = valid_loader if valid_loader is not None else self.valid_loader
+        self.test_loaders = test_loaders if test_loaders is not None else {}
+
+        if self.train_loader is None:
+            raise ValueError("No `train_loader` found. Please provide a value for `train_loader`")
+        if self.valid_loader is None:
+            logger.warning("No `valid_loader` found. Please provide a value for `valid_loader`")
+        if self.test_loaders is not None and not isinstance(self.test_loaders, dict):
+            raise ValueError("`test_loaders` must be a dictionary mapping dataset names to DataLoaders")
+
+        self.train_loader = self.accelerator.prepare_data_loader(self.train_loader)
+        self.train_loader.batch_sampler.even_batches = True
+        self.valid_loader = self.accelerator.prepare_data_loader(
+            self.valid_loader) if self.valid_loader is not None else None
+        self.valid_loader.batch_sampler.even_batches = self._pad_uneven_eval_batches
+        self.test_loaders = {k: self.accelerator.prepare_data_loader(v) for k, v in self.test_loaders.items()}
+        for test_loader in self.test_loaders.values():
+            test_loader.batch_sampler.even_batches = self._pad_uneven_eval_batches
+
+        if hasattr(self.train_loader, "batch_sampler") and self.train_loader.batch_sampler is not None:
+            batch_size = self.train_loader.batch_sampler.batch_size
+        else:
+            batch_size = self.train_loader.batch_size
+
+        if len(self.train_loader.dataset) % batch_size != 0 and not self.train_loader.drop_last:
+            logger.warning(
+                "Train dataset size % batch_size != 0 and drop_last=False, this might result in smaller " "last batch.")
+
+        self.training_params = TrainingParams()
+        if isinstance(training_params, DictConfig):
+            training_params = OmegaConf.to_container(training_params, resolve=True)
+        self.training_params.override(**training_params)
+
+        self.net = model
+
+        self._prep_net_for_train()
+        self._load_checkpoint_to_model()
+        if not self.ddp_silent_mode:
+            self._initialize_sg_logger_objects(additional_configs_to_log)
+
+        # SET RANDOM SEED
+        set_seed(seed=self.training_params.seed, device_specific=True)
+
+        silent_mode = self.training_params.silent_mode or self.ddp_silent_mode
+
+        # METRICS
+        self._set_train_metrics(train_metrics_list=self.training_params.train_metrics_list)
+        self._set_valid_metrics(valid_metrics_list=self.training_params.valid_metrics_list)
+        self.test_metrics = self.valid_metrics.clone()
+
+        # Store the metric to follow (loss\accuracy) and initialize as the worst value
+        self.metric_to_watch = self.training_params.metric_to_watch
+        self.greater_metric_to_watch_is_better = self.training_params.greater_metric_to_watch_is_better
+
+        # Allowing loading instantiated loss or string
+        if isinstance(self.training_params.loss, str):
+            self.criterion = LossesFactory().get({self.training_params.loss: self.training_params.criterion_params})
+
+        elif isinstance(self.training_params.loss, Mapping):
+            self.criterion = LossesFactory().get(self.training_params.loss)
+
+        elif isinstance(self.training_params.loss, nn.Module):
+            self.criterion = self.training_params.loss
+
+        self.criterion.to(self.accelerator.device)
+
+        self.max_epochs = self.training_params.max_epochs
+
+        self.ema = self.training_params.ema
+
+        self.precise_bn = self.training_params.precise_bn
+        self.precise_bn_batch_size = self.training_params.precise_bn_batch_size
+
+        self.batch_accumulate = self.training_params.batch_accumulate
+        num_batches = len(self.train_loader)
+
+        if self.ema:
+            self.ema_model = self._instantiate_ema_model(self.training_params.ema_params)
+            self.ema_model.updates = self.start_epoch * num_batches // self.batch_accumulate
+            if self.load_checkpoint:
+                if "ema_net" in self.checkpoint.keys():
+                    self.ema_model.ema.load_state_dict(self.checkpoint["ema_net"])
+                else:
+                    self.ema = False
+                    logger.warning(
+                        "[Warning] Checkpoint does not include EMA weights, continuing training without EMA.")
+
+        self.run_validation_freq = self.training_params.run_validation_freq
+
+        if self.max_epochs % self.run_validation_freq != 0:
+            logger.warning(
+                "max_epochs is not divisible by run_validation_freq. "
+                "Please check the training parameters and ensure that run_validation_freq has been set correctly."
+            )
+        self.run_test_freq = self.training_params.run_test_freq
+
+        timer = core_utils.Timer(self.accelerator.device)
+
+        # IF THE LR MODE IS NOT DEFAULT TAKE IT FROM THE TRAINING PARAMS
+        self.lr_mode = self.training_params.lr_mode
+        load_opt_params = self.training_params.load_opt_params
+
+        self.phase_callbacks = self.training_params.phase_callbacks or []
+        self.phase_callbacks = ListFactory(CallbacksFactory()).get(self.phase_callbacks)
+
+        warmup_mode = self.training_params.warmup_mode
+        warmup_callback_cls = None
+        if isinstance(warmup_mode, str):
+            from super_gradients.common.registry.registry import warn_if_deprecated
+
+            warn_if_deprecated(warmup_mode, LR_WARMUP_CLS_DICT)
+
+            warmup_callback_cls = LR_WARMUP_CLS_DICT[warmup_mode]
+        elif isinstance(warmup_mode, type) and issubclass(warmup_mode, LRCallbackBase):
+            warmup_callback_cls = warmup_mode
+        elif warmup_mode is not None:
+            pass
+        else:
+            raise RuntimeError("warmup_mode has to be either a name of a mode (str) or a subclass of PhaseCallback")
+
+        if isinstance(self.training_params.optimizer, str) or (
+                inspect.isclass(self.training_params.optimizer) and issubclass(
+            self.training_params.optimizer, torch.optim.Optimizer)
+        ):
+            self.optimizer = build_optimizer(net=self.accelerator.unwrap_model(self.net),
+                                             lr=self.training_params.initial_lr,
+                                             training_params=self.training_params)
+        elif isinstance(self.training_params.optimizer, torch.optim.Optimizer):
+            if self.training_params.initial_lr is not None:
+                raise RuntimeError("An instantiated optimizer cannot be passed along initial_lr != None")
+            self.optimizer = self.training_params.optimizer
+
+            # NEED TO EXTRACT INITAL_LR FROM THE OPTIMIZER PARAM GROUPS
+            self.training_params.initial_lr = get_initial_lr_from_optimizer(self.optimizer)
+        else:
+            raise UnsupportedOptimizerFormat()
+
+        self.optimizer = self.accelerator.prepare_optimizer(self.optimizer)
+
+        if warmup_callback_cls is not None:
+            self.phase_callbacks.append(
+                warmup_callback_cls(
+                    train_loader_len=len(self.train_loader),
+                    net=self.net,
+                    training_params=self.training_params,
+                    update_param_groups=self.update_param_groups,
+                    **self.training_params.to_dict(),
+                )
+            )
+
+        self._add_metrics_update_callback(Phase.TRAIN_BATCH_END)
+        self._add_metrics_update_callback(Phase.VALIDATION_BATCH_END)
+        self._add_metrics_update_callback(Phase.TEST_BATCH_END)
+
+        self.phase_callback_handler = CallbackHandler(callbacks=self.phase_callbacks)
+
+        if not self.ddp_silent_mode:
+            if self.training_params.dataset_statistics:
+                dataset_statistics_logger = DatasetStatisticsTensorboardLogger(self.sg_logger)
+                dataset_statistics_logger.analyze(
+                    self.train_loader, all_classes=self.classes, title="Train-set",
+                    anchors=self.accelerator.unwrap_model(self.net).arch_params.anchors
+                )
+                if self.valid_loader is not None:
+                    dataset_statistics_logger.analyze(self.valid_loader, all_classes=self.classes, title="val-set")
+
+        sg_trainer_utils.log_uncaught_exceptions(logger)
+
+        if not self.load_checkpoint or self.load_weights_only:
+            # WHEN STARTING TRAINING FROM SCRATCH, DO NOT LOAD OPTIMIZER PARAMS (EVEN IF LOADING BACKBONE)
+            self.start_epoch = 0
+            self._reset_best_metric()
+            load_opt_params = False
+
+        if self.lr_mode is not None:
+            lr_scheduler_callback = create_lr_scheduler_callback(
+                lr_mode=self.lr_mode,
+                train_loader=self.train_loader,
+                net=self.net,
+                training_params=self.training_params,
+                update_param_groups=self.update_param_groups,
+                optimizer=self.optimizer,
+            )
+            self.phase_callbacks.append(lr_scheduler_callback)
+
+            # NEED ACCESS TO THE UNDERLYING TORCH SCHEDULER FOR LOADING/SAVING IT'S STATE_DICT
+            if isinstance(lr_scheduler_callback, LRSchedulerCallback):
+                self._torch_lr_scheduler = lr_scheduler_callback.scheduler
+                if self.load_checkpoint:
+                    self._torch_lr_scheduler.load_state_dict(self.checkpoint["torch_scheduler_state_dict"])
+
+        # VERIFY GRADIENT CLIPPING VALUE
+        if self.training_params.clip_grad_norm is not None and self.training_params.clip_grad_norm <= 0:
+            raise TypeError("Params", "Invalid clip_grad_norm")
+
+        if self.load_checkpoint and load_opt_params:
+            self.optimizer.load_state_dict(self.checkpoint["optimizer_state_dict"])
+
+        self.pre_prediction_callback = CallbacksFactory().get(self.training_params.pre_prediction_callback)
+
+        if self.load_checkpoint:
+            scaler_state_dict = core_utils.get_param(self.checkpoint, "scaler_state_dict")
+            if scaler_state_dict is None:
+                logger.warning(
+                    "Mixed Precision - scaler state_dict not found in loaded model. This may case issues " "with loss scaling")
+            else:
+                self.accelerator.scaler.load_state_dict(scaler_state_dict)
+                logger.info("GradScaler state loaded successfully")
+
+        self.ckpt_best_name = self.training_params.ckpt_best_name
+
+        self.max_train_batches = self.training_params.max_train_batches
+        self.max_valid_batches = self.training_params.max_valid_batches
+
+        if self.training_params.max_train_batches is not None:
+            if self.training_params.max_train_batches > len(self.train_loader):
+                logger.warning("max_train_batches is greater than len(self.train_loader) and will have no effect.")
+                self.max_train_batches = len(self.train_loader)
+            elif self.training_params.max_train_batches <= 0:
+                raise ValueError("max_train_batches must be positive.")
+
+        if self.training_params.max_valid_batches is not None:
+            if self.training_params.max_valid_batches > len(self.valid_loader):
+                logger.warning("max_valid_batches is greater than len(self.valid_loader) and will have no effect.")
+                self.max_valid_batches = len(self.valid_loader)
+            elif self.training_params.max_valid_batches <= 0:
+                raise ValueError("max_valid_batches must be positive.")
+
+        # STATE ATTRIBUTE SET HERE FOR SUBSEQUENT TRAIN() CALLS
+        self._first_backward = True
+
+        context = PhaseContext(
+            optimizer=self.optimizer,
+            net=self.net,
+            experiment_name=self.experiment_name,
+            ckpt_dir=self.checkpoints_dir_path,
+            criterion=self.criterion,
+            lr_warmup_epochs=self.training_params.lr_warmup_epochs,
+            sg_logger=self.sg_logger,
+            train_loader=self.train_loader,
+            valid_loader=self.valid_loader,
+            training_params=self.training_params,
+            ddp_silent_mode=self.ddp_silent_mode,
+            checkpoint_params=self.checkpoint_params,
+            architecture=self.architecture,
+            arch_params=self.arch_params,
+            metric_to_watch=self.metric_to_watch,
+            device=self.accelerator.device,
+            ema_model=self.ema_model,
+            valid_metrics=self.valid_metrics,
+        )
+        self.phase_callback_handler.on_training_start(context)
+
+        # Check if the model supports sliding window inference.
+        model = self.accelerator.unwrap_model(context.net)
+        if (
+                context.training_params.phase_callbacks is not None
+                and "SlidingWindowValidationCallback" in context.training_params.phase_callbacks
+                and (not hasattr(model, "enable_sliding_window_validation") or not hasattr(model,
+                                                                                           "disable_sliding_window_validation"))
+        ):
+            raise ValueError(
+                "You can use sliding window validation callback, but your model does not support sliding window "
+                "inference. Please either remove the callback or use the model that supports sliding inference: "
+                "Segformer"
+            )
+
+        first_batch = next(iter(self.train_loader))
+        inputs, _, _ = sg_trainer_utils.unpack_batch_items(first_batch)
+
+        log_main_training_params(
+            multi_gpu=self.accelerator.distributed_type,
+            num_gpus=get_world_size(),
+            batch_size=batch_size,
+            batch_accumulate=self.batch_accumulate,
+            train_dataset_length=len(self.train_loader.dataset),
+            train_dataloader_len=len(self.train_loader),
+            max_train_batches=self.max_train_batches,
+            model=self.accelerator.unwrap_model(self.net),
+            param_groups=self.optimizer.param_groups,
+        )
+
+        self._maybe_set_preprocessing_params_for_model_from_dataset()
+
+        try:
+            # HEADERS OF THE TRAINING PROGRESS
+            if not silent_mode:
+                logger.info(
+                    f"Started training for {self.max_epochs - self.start_epoch} epochs ({self.start_epoch}/" f"{self.max_epochs - 1})\n")
+            for epoch in range(self.start_epoch, self.max_epochs):
+                # broadcast_from_master is necessary here, since in DDP mode, only the master node will
+                # receive the Ctrl-C signal, and we want all nodes to stop training.
+                timer.start()
+                if broadcast_from_master(context.stop_training):
+                    logger.info("Request to stop training has been received, stopping training")
+                    break
+
+                # Phase.TRAIN_EPOCH_START
+                # RUN PHASE CALLBACKS
+                context.update_context(epoch=epoch)
+                self.phase_callback_handler.on_train_loader_start(context)
+                train_metrics_tuple = self._train_epoch(context=context, silent_mode=silent_mode)
+
+                # Phase.TRAIN_EPOCH_END
+                # RUN PHASE CALLBACKS
+                train_metrics_dict = get_metrics_dict(train_metrics_tuple, self.train_metrics,
+                                                      self.loss_logging_items_names)
+
+                context.update_context(metrics_dict=train_metrics_dict)
+                self.phase_callback_handler.on_train_loader_end(context)
+
+                # CALCULATE PRECISE BATCHNORM STATS
+                if self.precise_bn:
+                    compute_precise_bn_stats(
+                        model=self.net, loader=self.train_loader, precise_bn_batch_size=self.precise_bn_batch_size,
+                        num_gpus=get_world_size()
+                    )
+                    if self.ema:
+                        compute_precise_bn_stats(
+                            model=self.ema_model.ema,
+                            loader=self.train_loader,
+                            precise_bn_batch_size=self.precise_bn_batch_size,
+                            num_gpus=get_world_size(),
+                        )
+
+                # model switch - we replace self.net with the ema model for the testing and saving part
+                # and then switch it back before the next training epoch
+                if self.ema:
+                    self.ema_model.update_attr(self.net)
+                    keep_model = self.net
+                    self.net = self.ema_model.ema
+
+                train_inf_time = timer.stop()
+                self._write_scalars_to_logger(metrics=train_metrics_dict, epoch=epoch, inference_time=train_inf_time,
+                                              tag="Train")
+
+                # RUN TEST ON VALIDATION SET EVERY self.run_validation_freq EPOCHS
+                valid_metrics_dict = {}
+                should_run_validation = self._should_run_validation_for_epoch(epoch)
+                should_run_validation = should_run_validation and self.valid_loader is not None
+                if should_run_validation:
+                    self.phase_callback_handler.on_validation_loader_start(context)
+                    timer.start()
+                    valid_metrics_dict = self._validate_epoch(context=context, silent_mode=silent_mode)
+                    val_inf_time = timer.stop()
+
+                    self.valid_monitored_values = sg_trainer_utils.update_monitored_values_dict(
+                        monitored_values_dict=self.valid_monitored_values,
+                        new_values_dict=valid_metrics_dict,
+                    )  # TODO: Move this logic inside a MonitoredValues class
+                    # Phase.VALIDATION_EPOCH_END
+                    # RUN PHASE CALLBACKS
+                    context.update_context(metrics_dict=valid_metrics_dict)
+                    self.phase_callback_handler.on_validation_loader_end(context)
+
+                    self._write_scalars_to_logger(metrics=valid_metrics_dict, epoch=epoch, inference_time=val_inf_time,
+                                                  tag="Valid")
+
+                test_metrics_dict = {}
+                if len(self.test_loaders) and (epoch + 1) % self.run_test_freq == 0:
+                    self.phase_callback_handler.on_test_loader_start(context)
+                    test_inf_time = 0.0
+                    for dataset_name, dataloader in self.test_loaders.items():
+                        timer.start()
+                        dataset_metrics_dict = self._test_epoch(data_loader=dataloader, context=context,
+                                                                silent_mode=silent_mode, dataset_name=dataset_name)
+                        test_inf_time += timer.stop()
+                        dataset_metrics_dict_with_name = {
+                            f"{dataset_name}:{metric_name}": metric_value for metric_name, metric_value in
+                            dataset_metrics_dict.items()
+                        }
+                        self.test_monitored_values = sg_trainer_utils.update_monitored_values_dict(
+                            monitored_values_dict=self.test_monitored_values,
+                            new_values_dict=dataset_metrics_dict_with_name,
+                        )  # TODO: Move this logic inside a MonitoredValues class
+
+                        test_metrics_dict.update(**dataset_metrics_dict_with_name)
+                    context.update_context(metrics_dict=test_metrics_dict)
+                    self.phase_callback_handler.on_test_loader_end(context)
+
+                    self._write_scalars_to_logger(metrics=test_metrics_dict, epoch=epoch, inference_time=test_inf_time,
+                                                  tag="Test")
+
+                if self.ema:
+                    self.net = keep_model
+
+                if not self.ddp_silent_mode:
+                    self.sg_logger.add_scalars(tag_scalar_dict=self._epoch_start_logging_values, global_step=epoch)
+
+                    # SAVING AND LOGGING OCCURS ONLY IN THE MAIN PROCESS (IN CASES THERE ARE SEVERAL PROCESSES - DDP)
+                    if should_run_validation and self.training_params.save_model:
+                        self._save_checkpoint(
+                            optimizer=self.optimizer,
+                            epoch=1 + epoch,
+                            train_metrics_dict=train_metrics_dict,
+                            validation_results_dict=valid_metrics_dict,
+                            context=context,
+                        )
+                    self.sg_logger.upload()
+
+                if not silent_mode:
+                    sg_trainer_utils.display_epoch_summary(
+                        epoch=context.epoch,
+                        n_digits=4,
+                        monitored_values_dict={
+                            "Train": self.train_monitored_values,
+                            "Validation": self.valid_monitored_values,
+                            "Test": self.test_monitored_values,
+                        },
+                    )
+
+            # PHASE.AVERAGE_BEST_MODELS_VALIDATION_START
+            self.phase_callback_handler.on_average_best_models_validation_start(context)
+
+            # Evaluating the average model and removing snapshot averaging file if training is completed
+            if self.training_params.average_best_models:
+                self._validate_final_average_model(context=context, checkpoint_dir_path=self.checkpoints_dir_path,
+                                                   cleanup_snapshots_pkl_file=True)
+
+            # PHASE.AVERAGE_BEST_MODELS_VALIDATION_END
+            self.phase_callback_handler.on_average_best_models_validation_end(context)
+
+        except KeyboardInterrupt:
+            context.update_context(stop_training=True)
+            logger.info(
+                "\n[MODEL TRAINING EXECUTION HAS BEEN INTERRUPTED]... Please wait until SOFT-TERMINATION process "
+                "finishes and saves all of the Model Checkpoints and log files before terminating..."
+            )
+            logger.info("For HARD Termination - Stop the process again")
+
+        finally:
+            if self.accelerator.distributed_type == DistributedType.MULTI_GPU:
+                # CLEAN UP THE MULTI-GPU PROCESS GROUP WHEN DONE
+                if torch.distributed.is_initialized() and self.training_params.kill_ddp_pgroup_on_end:
+                    torch.distributed.destroy_process_group()
+
+            # PHASE.TRAIN_END
+            self.phase_callback_handler.on_training_end(context)
+
+            if not self.ddp_silent_mode:
+                self.sg_logger.close()
+
+    def _maybe_set_preprocessing_params_for_model_from_dataset(self):
+        processing_params = self._get_preprocessing_from_valid_loader()
+        if processing_params is not None:
+            self.accelerator.unwrap_model(self.net).set_dataset_processing_params(**processing_params)
+
+    def _get_preprocessing_from_valid_loader(self) -> Optional[dict]:
+        valid_loader = self.valid_loader
+        if valid_loader is None:
+            return None
+
+        if isinstance(self.accelerator.unwrap_model(self.net), HasPredict) and isinstance(valid_loader.dataset,
+                                                                                          HasPreprocessingParams):
+            try:
+                return valid_loader.dataset.get_dataset_preprocessing_params()
+            except Exception as e:
+                logger.warning(
+                    f"Could not set preprocessing pipeline from the validation dataset:\n {e}.\n Before calling"
+                    "predict make sure to call set_dataset_processing_params."
+                )
+
+    def _reset_best_metric(self):
+        self.best_metric = -1 * np.inf if self.greater_metric_to_watch_is_better else np.inf
+
+    def _reset_metrics(self):
+        for metric in ("train_metrics", "valid_metrics", "test_metrics"):
+            if hasattr(self, metric) and getattr(self, metric) is not None:
+                getattr(self, metric).reset()
+
+    @resolve_param("train_metrics_list", ListFactory(MetricsFactory()))
+    def _set_train_metrics(self, train_metrics_list):
+        self.train_metrics = MetricCollection(train_metrics_list)
+
+        for metric_name, metric in self.train_metrics.items():
+            if hasattr(metric, "greater_component_is_better"):
+                self.greater_train_metrics_is_better.update(metric.greater_component_is_better)
+            elif hasattr(metric, "greater_is_better"):
+                self.greater_train_metrics_is_better[metric_name] = metric.greater_is_better
+            else:
+                self.greater_train_metrics_is_better[metric_name] = None
+
+    @resolve_param("valid_metrics_list", ListFactory(MetricsFactory()))
+    def _set_valid_metrics(self, valid_metrics_list):
+        self.valid_metrics = MetricCollection(valid_metrics_list)
+
+        for metric_name, metric in self.valid_metrics.items():
+            if hasattr(metric, "greater_component_is_better"):
+                self.greater_valid_metrics_is_better.update(metric.greater_component_is_better)
+            elif hasattr(metric, "greater_is_better"):
+                self.greater_valid_metrics_is_better[metric_name] = metric.greater_is_better
+            else:
+                self.greater_valid_metrics_is_better[metric_name] = None
+
+    @resolve_param("test_metrics_list", ListFactory(MetricsFactory()))
+    def _set_test_metrics(self, test_metrics_list):
+        self.test_metrics = MetricCollection(test_metrics_list)
+
+    def _validate_final_average_model(self, context: PhaseContext, checkpoint_dir_path: str,
+                                      cleanup_snapshots_pkl_file=False):
+        """
+        Testing the averaged model by loading the last saved average checkpoint and running test.
+        Will be loaded to each of DDP processes
+        :param cleanup_pkl_file: a flag for deleting the 10 best snapshots dictionary
+        """
+        logger.info("RUNNING ADDITIONAL TEST ON THE AVERAGED MODEL...")
+
+        keep_state_dict = deepcopy(self.net.state_dict())
+        # SETTING STATE DICT TO THE AVERAGE MODEL FOR EVALUATION
+        average_model_ckpt_path = os.path.join(checkpoint_dir_path, self.average_model_checkpoint_filename)
+        local_rank = get_local_rank()
+
+        # WAIT FOR MASTER RANK TO SAVE THE CKPT BEFORE WE TRY TO READ IT.
+        with wait_for_the_master(local_rank):
+            average_model_sd = read_ckpt_state_dict(average_model_ckpt_path)["net"]
+
+        self.accelerator.unwrap_model(self.net).load_state_dict(average_model_sd)
+        # testing the averaged model and save instead of best model if needed
+        context.update_context(epoch=self.max_epochs)
+        averaged_model_results_dict = self._validate_epoch(context=context)
+        self.valid_monitored_values = sg_trainer_utils.update_monitored_values_dict(
+            monitored_values_dict=self.valid_monitored_values,
+            new_values_dict=averaged_model_results_dict,
+        )  # TODO: Move this logic inside a MonitoredValues class
+
+        # Reverting the current model
+        self.net.load_state_dict(keep_state_dict)
+
+        if not self.ddp_silent_mode:
+            write_struct = ""
+            for name, value in averaged_model_results_dict.items():
+                write_struct += "%s: %.3f  \n  " % (name, value)
+                self.sg_logger.add_scalar(name, value, global_step=self.max_epochs)
+
+            self.sg_logger.add_text("Averaged_Model_Performance", write_struct, self.max_epochs)
+            if cleanup_snapshots_pkl_file:
+                self.model_weight_averaging.cleanup()
+
+    @property
+    def get_arch_params(self):
+        return self.arch_params.to_dict()
+
+    @property
+    def get_structure(self):
+        return self.accelerator.unwrap_model(self.net).structure
+
+    @property
+    def get_architecture(self):
+        return self.architecture
+
+    def set_experiment_name(self, experiment_name):
+        self.experiment_name = experiment_name
+
+    @property
+    def get_module(self):
+        return self.net
+
+    def set_module(self, module):
+        self.net = module
+
+    # FIXME - we need to resolve flake8's 'function is too complex' for this function
+    def _load_checkpoint_to_model(self):
+        self.checkpoint = {}
+        strict_load = core_utils.get_param(self.training_params, "resume_strict_load", StrictLoad.ON)
+        ckpt_name = core_utils.get_param(self.training_params, "ckpt_name", "ckpt_latest.pth")
+
+        resume = core_utils.get_param(self.training_params, "resume", False)
+        run_id = core_utils.get_param(self.training_params, "run_id", None)
+        resume_path = core_utils.get_param(self.training_params, "resume_path")
+        resume_from_remote_sg_logger = core_utils.get_param(self.training_params, "resume_from_remote_sg_logger", False)
+        self.load_checkpoint = resume or (run_id is not None) or (
+                resume_path is not None) or resume_from_remote_sg_logger
+
+        if run_id is None:  # User did not specify a `run_id`
+            if resume and not (resume_from_remote_sg_logger or resume_path):
+                # If `resume_from_remote_sg_logger` or `resume_path` is used, we want to create a new run_id.
+                run_id = get_latest_run_id(checkpoints_root_dir=self.ckpt_root_dir,
+                                           experiment_name=self.experiment_name)
+                logger.info("Resuming training from latest run.")
+            else:
+                run_id = generate_run_id()
+                logger.info(f"Starting a new run with `run_id={run_id}`")
+        else:
+            validate_run_id(ckpt_root_dir=self.ckpt_root_dir, experiment_name=self.experiment_name, run_id=run_id)
+            logger.info(f"Resuming training from `run_id={run_id}`")
+
+        self.checkpoints_dir_path = get_checkpoints_dir_path(ckpt_root_dir=self.ckpt_root_dir,
+                                                             experiment_name=self.experiment_name, run_id=run_id)
+        logger.info(f"Checkpoints directory: {self.checkpoints_dir_path}")
+
+        with wait_for_the_master(get_local_rank()):
+            if resume_from_remote_sg_logger and not self.ddp_silent_mode:
+                self.sg_logger.download_remote_ckpt(ckpt_name=ckpt_name)
+
+        if self.load_checkpoint or resume_path:
+            checkpoint_path = resume_path if resume_path else os.path.join(self.checkpoints_dir_path, ckpt_name)
+            if isinstance(strict_load, str):
+                strict_load = StrictLoad(strict_load)
+
+            net = self.accelerator.unwrap_model(self.net)
+
+            # LOAD THE LOCAL CHECKPOINT PATH INTO A state_dict OBJECT
+            checkpoint = read_ckpt_state_dict(ckpt_path=checkpoint_path)
+
+            # LOAD THE CHECKPOINTS WEIGHTS TO THE MODEL
+            adaptive_load_state_dict(net, checkpoint, strict_load)
+
+            message_suffix = " checkpoint."
+            message_model = "model"
+            logger.info(
+                "Successfully loaded " + message_model + " weights from " + checkpoint_path + message_suffix)
+
+            _maybe_load_preprocessing_params(net, checkpoint)
+
+            if self.load_weights_only:
+                # DISCARD ALL THE DATA STORED IN CHECKPOINT OTHER THAN THE WEIGHTS
+                [checkpoint.pop(key) for key in list(checkpoint.keys()) if key != "net"]
+
+            self.checkpoint = checkpoint
+
+            if "ema_net" in self.checkpoint.keys():
+                logger.warning(
+                    "[WARNING] Main network has been loaded from checkpoint but EMA network exists as "
+                    "well. It "
+                    " will only be loaded during validation when training with ema=True. "
+                )
+
+        # UPDATE TRAINING PARAMS IF THEY EXIST & WE ARE NOT LOADING AN EXTERNAL MODEL's WEIGHTS
+        self.best_metric = self.checkpoint["acc"] if "acc" in self.checkpoint.keys() else -1
+        self.start_epoch = self.checkpoint["epoch"] if "epoch" in self.checkpoint.keys() else 0
+
+    def _prep_for_test(
+            self, test_loader: torch.utils.data.DataLoader = None, loss=None, test_metrics_list=None,
+            loss_logging_items_names=None, test_phase_callbacks=None
+    ):
+        """Run commands that are common to all models"""
+        self.net = self.accelerator.prepare_model(self.net)
+        # SET THE MODEL IN evaluation STATE
+        self.net.eval()
+
+        # IF SPECIFIED IN THE FUNCTION CALL - OVERRIDE THE self ARGUMENTS
+        self.test_loaders = test_loader or self.test_loaders
+        if isinstance(self.test_loaders, Dict):
+            self.test_loaders = {k: self.accelerator.prepare_data_loader(v) for k, v in self.test_loaders.items()}
+        else:
+            self.test_loaders = self.accelerator.prepare_data_loader(self.test_loaders)
+        self.criterion = loss or self.criterion
+        self.criterion = self.criterion.to(self.accelerator.device)
+        self.criterion.eval()
+        self.loss_logging_items_names = loss_logging_items_names or self.loss_logging_items_names
+        self.phase_callbacks = test_phase_callbacks or self.phase_callbacks
+
+        if self.phase_callbacks is None:
+            self.phase_callbacks = []
+
+        if test_metrics_list:
+            self._set_test_metrics(test_metrics_list)
+            self._add_metrics_update_callback(Phase.TEST_BATCH_END)
+            self.phase_callback_handler = CallbackHandler(self.phase_callbacks)
+
+        # WHEN TESTING WITHOUT A LOSS FUNCTION- CREATE EPOCH HEADERS FOR PRINTS
+        if self.criterion is None:
+            self.loss_logging_items_names = []
+
+        if self.test_metrics is None:
+            raise ValueError(
+                "Metrics are required to perform test. Pass them through test_metrics_list arg when "
+                "calling test or through training_params when calling train(...)"
+            )
+        if test_loader is None:
+            raise ValueError(
+                "Test dataloader is required to perform test. Make sure to either pass it through " "test_loader arg.")
+
+        # RESET METRIC RUNNERS
+        self._reset_metrics()
+        self.test_metrics.to(self.accelerator.device)
+
+        if self.arch_params is None:
+            self._init_arch_params()
+
+    def _add_metrics_update_callback(self, phase: Phase):
+        """
+        Adds MetricsUpdateCallback to be fired at phase
+
+        :param phase: Phase for the metrics callback to be fired at
+        """
+        self.phase_callbacks.append(MetricsUpdateCallback(phase))
+
+    def _initialize_sg_logger_objects(self, additional_configs_to_log: Dict = None):
+        """Initialize object that collect, write to disk, monitor and store remotely all training outputs"""
+        sg_logger = core_utils.get_param(self.training_params, "sg_logger")
+
+        # OVERRIDE SOME PARAMETERS TO MAKE SURE THEY MATCH THE TRAINING PARAMETERS
+        general_sg_logger_params = {
+            "experiment_name": self.experiment_name,
+            "storage_location": "local",
+            "resumed": self.load_checkpoint,
+            "training_params": self.training_params,
+            "checkpoints_dir_path": self.checkpoints_dir_path,
+        }
+
+        if sg_logger is None:
+            raise RuntimeError("sg_logger must be defined in training params (see default_training_params)")
+
+        if isinstance(sg_logger, AbstractSGLogger):
+            self.sg_logger = sg_logger
+        elif isinstance(sg_logger, str):
+            sg_logger_cls = SG_LOGGERS.get(sg_logger)
+            if sg_logger_cls is None:
+                raise RuntimeError(
+                    f"sg_logger={sg_logger} not registered in SuperGradients. Available {list(SG_LOGGERS.keys())}")
+
+            sg_logger_params = core_utils.get_param(self.training_params, "sg_logger_params", {})
+            if issubclass(sg_logger_cls, BaseSGLogger):
+                sg_logger_params = {**sg_logger_params, **general_sg_logger_params}
+
+            # Some sg_logger require model_name, but not all of them.
+            if "model_name" in get_callable_param_names(sg_logger_cls.__init__):
+                if sg_logger_params.get("model_name") is None:
+                    # Use the model name used in `models.get(...)` if relevant
+                    sg_logger_params["model_name"] = get_model_name(self.accelerator.unwrap_model(self.net))
+
+                if sg_logger_params["model_name"] is None:
+                    raise ValueError(
+                        f'`model_name` is required to use `training_hyperparams.sg_logger="{sg_logger}"`.\n'
+                        'Please set `training_hyperparams.sg_logger_params.model_name="<your-model-name>"`.\n'
+                        "Note that specifying `model_name` is not required when the model was loaded using `models.get(...)`."
+                    )
+
+            self.sg_logger = sg_logger_cls(**sg_logger_params)
+        else:
+            raise RuntimeError("sg_logger can be either an sg_logger name (str) or an instance of AbstractSGLogger")
+
+        if not isinstance(self.sg_logger, BaseSGLogger):
+            logger.warning(
+                "WARNING! Using a user-defined sg_logger: files will not be automatically written to disk!\n"
+                "Please make sure the provided sg_logger writes to disk or compose your sg_logger to BaseSGLogger"
+            )
+
+        hyper_param_config = self._get_hyper_param_config()
+        if additional_configs_to_log is not None:
+            hyper_param_config["additional_configs_to_log"] = additional_configs_to_log
+        self.sg_logger.add_config("hyper_params", hyper_param_config)
+        self.sg_logger.flush()
+
+    def _get_hyper_param_config(self):
+        """
+        Creates a training hyper param config for logging.
+        """
+        additional_log_items = {
+            "initial_LR": self.training_params.initial_lr,
+            "num_devices": get_world_size(),
+            "multi_gpu": str(self.accelerator.distributed_type),
+            "device_type": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        }
+        # ADD INSTALLED PACKAGE LIST + THEIR VERSIONS
+        if self.training_params.log_installed_packages:
+            additional_log_items["installed_packages"] = get_installed_packages()
+
+        dataset_params = {
+            "train_dataset_params": self.train_loader.dataset.dataset_params if hasattr(
+                self.train_loader.dataset, "dataset_params") else None,
+            "train_dataloader_params": self.train_loader.dataloader_params if hasattr(
+                self.train_loader, "dataloader_params") else None,
+        }
+        if self.valid_loader is not None:
+            dataset_params.update({
+                "valid_dataset_params": self.valid_loader.dataset.dataset_params if hasattr(
+                    self.valid_loader.dataset, "dataset_params") else None,
+                "valid_dataloader_params": self.valid_loader.dataloader_params if hasattr(
+                    self.valid_loader, "dataloader_params") else None,
+            })
+
+        hyper_param_config = {
+            "checkpoint_params": self.checkpoint_params.__dict__,
+            "training_hyperparams": self.training_params.__dict__,
+            "dataset_params": dataset_params,
+            "additional_log_items": additional_log_items,
+        }
+        return hyper_param_config
+
+    def _write_scalars_to_logger(self, metrics: dict, epoch: int, inference_time: float, tag: str) -> None:
+        """
+        Method for writing metrics and LR info to logger.
+
+        :param metrics:         (dict) dict of metrics..
+        :param epoch:           (inf) 1-based number of epoch.
+        :param inference_time:  (float) time of inference.
+        :param tag:             (str) tag for writing to logger (rule of thumb: Train/Test/Valid)
+        """
+
+        if not self.ddp_silent_mode:
+            info_dict = {f"{tag} Inference Time": inference_time, **{f"{tag}_{k}": v for k, v in metrics.items()}}
+
+            self.sg_logger.add_scalars(tag_scalar_dict=info_dict, global_step=epoch)
+
+    def _get_epoch_start_logging_values(self) -> dict:
+        """Get all the values that should be logged at the start of each epoch.
+        This is useful for values like Learning Rate that can change over an epoch."""
+        lrs = [self.optimizer.param_groups[i]["lr"] for i in range(len(self.optimizer.param_groups))]
+        lr_titles = (
+            ["LR/" + self.optimizer.param_groups[i].get("name", str(i)) for i in
+             range(len(self.optimizer.param_groups))]
+            if len(self.optimizer.param_groups) > 1
+            else ["LR"]
+        )
+        lr_dict = {lr_titles[i]: lrs[i] for i in range(len(lrs))}
+        return lr_dict
+
+    def test(
+            self,
+            model: nn.Module = None,
+            test_loader: torch.utils.data.DataLoader = None,
+            loss: torch.nn.modules.loss._Loss = None,
+            silent_mode: bool = False,
+            test_metrics_list=None,
+            loss_logging_items_names=None,
+            metrics_progress_verbose=False,
+            test_phase_callbacks=None,
+            use_ema_net=True,
+    ) -> Dict[str, float]:
+        """
+        Evaluates the model on given dataloader and metrics.
+        :param model: model to perfrom test on. When none is given, will try to use self.net (defalut=None).
+        :param test_loader: dataloader to perform test on.
+        :param test_metrics_list: (list(torchmetrics.Metric)) metrics list for evaluation.
+        :param silent_mode: (bool) controls verbosity
+        :param metrics_progress_verbose: (bool) controls the verbosity of metrics progress (default=False). Slows down the program.
+        :param use_ema_net (bool) whether to perform test on self.ema_model.ema (when self.ema_model.ema exists,
+            otherwise self.net will be tested) (default=True)
+        :return: results tuple (tuple) containing the loss items and metric values.
+
+        All of the above args will override Trainer's corresponding attribute when not equal to None. Then evaluation
+         is ran on self.test_loader with self.test_metrics.
+        """
+
+        self.net = model or self.net
+
+        # IN CASE TRAINING WAS PERFROMED BEFORE TEST- MAKE SURE TO TEST THE EMA MODEL (UNLESS SPECIFIED OTHERWISE BY
+        # use_ema_net)
+
+        if use_ema_net and self.ema_model is not None:
+            keep_model = self.net
+            self.net = self.ema_model.ema
+
+        self._prep_for_test(
+            test_loader=test_loader,
+            loss=loss,
+            test_metrics_list=test_metrics_list,
+            loss_logging_items_names=loss_logging_items_names,
+            test_phase_callbacks=test_phase_callbacks,
+        )
+
+        context = PhaseContext(
+            criterion=self.criterion,
+            device=self.device,
+            sg_logger=self.sg_logger,
+        )
+        if test_metrics_list:
+            context.update_context(test_metrics=self.test_metrics)
+        if test_phase_callbacks:
+            context.update_context(net=self.net)
+            context.update_context(test_loader=test_loader)
+
+        self.phase_callback_handler.on_test_loader_start(context)
+        test_results = self.evaluate(
+            data_loader=self.test_loaders,
+            metrics=self.test_metrics,
+            evaluation_type=EvaluationType.TEST,
+            silent_mode=silent_mode,
+            metrics_progress_verbose=metrics_progress_verbose,
+        )
+        self.phase_callback_handler.on_test_loader_end(context)
+
+        # SWITCH BACK BETWEEN NETS SO AN ADDITIONAL TRAINING CAN BE DONE AFTER TEST
+        if use_ema_net and self.ema_model is not None:
+            self.net = keep_model
+
+        self._first_backward = True
+
+        return test_results
+
+    def _validate_epoch(self, context: PhaseContext, silent_mode: bool = False) -> Dict[str, float]:
+        """
+        Runs evaluation on self.valid_loader, with self.valid_metrics.
+
+        :param epoch: (int) epoch idx
+        :param silent_mode: (bool) controls verbosity
+
+        :return: results tuple (tuple) containing the loss items and metric values.
+        """
+        self.net.eval()
+        if self.criterion is not None:
+            self.criterion.eval()
+        self._reset_metrics()
+        self.valid_metrics.to(self.accelerator.device)
+        return self.evaluate(
+            data_loader=self.valid_loader,
+            metrics=self.valid_metrics,
+            evaluation_type=EvaluationType.VALIDATION,
+            epoch=context.epoch,
+            silent_mode=silent_mode,
+            max_batches=self.max_valid_batches,
+        )
+
+    def _test_epoch(self, data_loader: DataLoader, context: PhaseContext, silent_mode: bool = False,
+                    dataset_name: str = "") -> Dict[str, float]:
+        """
+        Evaluate the input loader on given metrics.
+
+        :param epoch: (int) epoch idx
+        :param silent_mode: (bool) controls verbosity
+
+        :return: results tuple (tuple) containing the loss items and metric values.
+        """
+        self.net.eval()
+        if self.criterion is not None:
+            self.criterion.eval()
+        self._reset_metrics()
+        self.test_metrics.to(self.accelerator.device)
+        return self.evaluate(
+            data_loader=data_loader,
+            metrics=self.test_metrics,
+            evaluation_type=EvaluationType.TEST,
+            epoch=context.epoch,
+            silent_mode=silent_mode,
+            dataset_name=dataset_name,
+        )
+
+    def evaluate(
+            self,
+            data_loader: torch.utils.data.DataLoader,
+            metrics: MetricCollection,
+            evaluation_type: EvaluationType,
+            epoch: int = None,
+            silent_mode: bool = False,
+            metrics_progress_verbose: bool = False,
+            dataset_name: str = "",
+            max_batches: Optional[int] = None,
+    ) -> Dict[str, float]:
+        """
+        Evaluates the model on given dataloader and metrics.
+
+        :param data_loader: dataloader to perform evaluataion on
+        :param metrics: (MetricCollection) metrics for evaluation
+        :param evaluation_type: (EvaluationType) controls which phase callbacks will be used (for example, on batch end,
+            when evaluation_type=EvaluationType.VALIDATION the Phase.VALIDATION_BATCH_END callbacks will be triggered)
+        :param epoch: (int) epoch idx
+        :param silent_mode: (bool) controls verbosity
+        :param metrics_progress_verbose: (bool) controls the verbosity of metrics progress (default=False).
+            Slows down the program significantly.
+
+        :return: results tuple (tuple) containing the loss items and metric values.
+        """
+
+        # THE DISABLE FLAG CONTROLS WHETHER THE PROGRESS BAR IS SILENT OR PRINTS THE LOGS
+        loss_avg_meter = core_utils.utils.AverageMeter()
+
+        lr_warmup_epochs = self.training_params.lr_warmup_epochs if self.training_params else None
+        context = PhaseContext(
+            net=self.net,
+            epoch=epoch,
+            metrics_compute_fn=metrics,
+            loss_avg_meter=loss_avg_meter,
+            criterion=self.criterion,
+            device=self.accelerator.device,
+            lr_warmup_epochs=lr_warmup_epochs,
+            sg_logger=self.sg_logger,
+            train_loader=self.train_loader,
+            valid_loader=self.valid_loader,
+            loss_logging_items_names=self.loss_logging_items_names,
+        )
+
+        expected_iterations = len(data_loader) if max_batches is None else max_batches
+
+        with tqdm(
+                data_loader, total=expected_iterations, bar_format="{l_bar}{bar:10}{r_bar}", dynamic_ncols=True,
+                disable=silent_mode
+        ) as progress_bar_data_loader:
+            if not silent_mode:
+                # PRINT TITLES
+                pbar_start_msg = "Validating" if evaluation_type == EvaluationType.VALIDATION else "Testing"
+                if dataset_name:
+                    pbar_start_msg += f' dataset="{dataset_name}:"'
+                if epoch:
+                    pbar_start_msg += f" epoch {epoch}"
+                progress_bar_data_loader.set_description(pbar_start_msg)
+            with torch.no_grad():
+                for batch_idx, batch_items in enumerate(progress_bar_data_loader):
+                    if evaluation_type == EvaluationType.VALIDATION and expected_iterations <= batch_idx:
+                        break
+
+                    inputs, targets, additional_batch_items = sg_trainer_utils.unpack_batch_items(batch_items)
+
+                    # TRIGGER PHASE CALLBACKS CORRESPONDING TO THE EVALUATION TYPE
+                    context.update_context(
+                        batch_idx=batch_idx, inputs=inputs, target=targets,
+                        additional_batch_items=additional_batch_items, **additional_batch_items
+                    )
+                    if evaluation_type == EvaluationType.VALIDATION:
+                        self.phase_callback_handler.on_validation_batch_start(context)
+                    else:
+                        self.phase_callback_handler.on_test_batch_start(context)
+
+                    output = self.net(inputs)
+                    context.update_context(preds=output)
+
+                    if self.criterion is not None:
+                        # STORE THE loss_items ONLY, THE 1ST RETURNED VALUE IS THE loss FOR BACKPROP DURING TRAINING
+                        loss_tuple = self._get_losses(output, targets)[1].cpu()
+                        context.update_context(loss_log_items=loss_tuple)
+
+                    # TRIGGER PHASE CALLBACKS CORRESPONDING TO THE EVALUATION TYPE
+                    if evaluation_type == EvaluationType.VALIDATION:
+                        self.phase_callback_handler.on_validation_batch_end(context)
+                    else:
+                        self.phase_callback_handler.on_test_batch_end(context)
+
+                    # COMPUTE METRICS IF PROGRESS VERBOSITY IS SET
+                    if metrics_progress_verbose and not silent_mode:
+                        # COMPUTE THE RUNNING USER METRICS AND LOSS RUNNING ITEMS. RESULT TUPLE IS THEIR CONCATENATION.
+                        logging_values = get_logging_values(loss_avg_meter, metrics, self.criterion)
+                        pbar_message_dict = get_train_loop_description_dict(logging_values, metrics,
+                                                                            self.loss_logging_items_names)
+
+                        progress_bar_data_loader.set_postfix(**pbar_message_dict)
+
+            logging_values = get_logging_values(loss_avg_meter, metrics, self.criterion)
+            # NEED TO COMPUTE METRICS FOR THE FIRST TIME IF PROGRESS VERBOSITY IS NOT SET
+            if not metrics_progress_verbose:
+                # COMPUTE THE RUNNING USER METRICS AND LOSS RUNNING ITEMS. RESULT TUPLE IS THEIR CONCATENATION.
+                pbar_message_dict = get_train_loop_description_dict(logging_values, metrics,
+                                                                    self.loss_logging_items_names)
+
+                progress_bar_data_loader.set_postfix(**pbar_message_dict)
+
+            # TODO: SUPPORT PRINTING AP PER CLASS- SINCE THE METRICS ARE NOT HARD CODED ANYMORE (as done in
+            #  calc_batch_prediction_accuracy_per_class in metric_utils.py), THIS IS ONLY RELEVANT WHEN CHOOSING
+            #  DETECTIONMETRICS, WHICH ALREADY RETURN THE METRICS VALUEST HEMSELVES AND NOT THE ITEMS REQUIRED FOR SUCH
+            #  COMPUTATION. ALSO REMOVE THE BELOW LINES BY IMPLEMENTING CRITERION AS A TORCHMETRIC.
+
+            if self.accelerator.distributed_type == DistributedType.MULTI_GPU:
+                logging_values = reduce_results_tuple_for_ddp(logging_values, next(self.net.parameters()).device)
+
+        return get_train_loop_description_dict(logging_values, metrics, self.loss_logging_items_names)
+
+    def _instantiate_ema_model(self, ema_params: Mapping[str, Any]) -> ModelEMA:
+        """Instantiate ema model for standard SgModule.
+        :param decay_type: (str) The decay climb schedule. See EMA_DECAY_FUNCTIONS for more details.
+        :param decay: The maximum decay value. As the training process advances, the decay will climb towards this value
+                      according to decay_type schedule. See EMA_DECAY_FUNCTIONS for more details.
+        :param kwargs: Additional parameters for the decay function. See EMA_DECAY_FUNCTIONS for more details.
+        """
+        logger.info(f"Using EMA with params {ema_params}")
+        return ModelEMA.from_params(self.net, **ema_params)
+
+    @property
+    def get_net(self):
+        """
+        Getter for network.
+        :return: torch.nn.Module, self.net
+        """
+        return self.net
+
+    def set_net(self, net: torch.nn.Module):
+        """
+        Setter for network.
+
+        :param net: torch.nn.Module, value to set net
+        :return:
+        """
+        self.net = net
+
+    def set_ckpt_best_name(self, ckpt_best_name):
+        """
+        Setter for best checkpoint filename.
+
+        :param ckpt_best_name: str, value to set ckpt_best_name
+        """
+        self.ckpt_best_name = ckpt_best_name
+
+    def set_ema(self, val: bool):
+        """
+        Setter for self.ema
+
+        :param val: bool, value to set ema
+        """
+        self.ema = val
+
+    def _init_loss_logging_names(self, loss_logging_items):
+        criterion_name = self.criterion.__class__.__name__
+        component_names = None
+        if hasattr(self.criterion, "component_names"):
+            component_names = self.criterion.component_names
+        elif len(loss_logging_items) > 1:
+            component_names = ["loss_" + str(i) for i in range(len(loss_logging_items))]
+
+        if component_names is not None:
+            self.loss_logging_items_names = [criterion_name + "/" + component_name for component_name in
+                                             component_names]
+            if self.metric_to_watch in component_names:
+                self.metric_to_watch = criterion_name + "/" + self.metric_to_watch
+        else:
+            self.loss_logging_items_names = [criterion_name]
+
+    @classmethod
+    def quantize_from_config(cls, cfg: Union[DictConfig, dict]) -> Tuple[nn.Module, Tuple]:
+        """
+        Perform quantization aware training (QAT) according to a recipe configuration.
+
+        This method will instantiate all the objects specified in the recipe, build and quantize the model,
+        and calibrate the quantized model. The resulting quantized model and the output of the trainer.train()
+        method will be returned.
+
+        The quantized model will be exported to ONNX along with other checkpoints.
+
+        The call to self.quantize (see docs in the next method) is done with the created
+         train_loader and valid_loader. If no calibration data loader is passed through cfg.calib_loader,
+         a train data laoder with the validation transforms is used for calibration.
+
+        :param cfg: The parsed DictConfig object from yaml recipe files or a dictionary.
+        :return: A tuple containing the quantized model and the output of trainer.train() method.
+
+        :raises ValueError: If the recipe does not have the required key `quantization_params` or
+        `checkpoint_params.checkpoint_path` in it.
+        :raises NotImplementedError: If the recipe requests multiple GPUs or num_gpus is not equal to 1.
+        :raises ImportError: If pytorch-quantization import was unsuccessful
+
+        """
+        if _imported_pytorch_quantization_failure is not None:
+            raise _imported_pytorch_quantization_failure
+
+        # INSTANTIATE ALL OBJECTS IN CFG
+        cfg = hydra.utils.instantiate(cfg)
+
+        # TRIGGER CFG MODIFYING CALLBACKS
+        cfg = cls._trigger_cfg_modifying_callbacks(cfg)
+
+        quantization_params = get_param(cfg, "quantization_params")
+
+        if quantization_params is None:
+            logger.warning("Your recipe does not include quantization_params. Using default quantization params.")
+            quantization_params = load_recipe("quantization_params/default_quantization_params").quantization_params
+            cfg.quantization_params = quantization_params
+
+        if get_param(cfg.checkpoint_params, "checkpoint_path") is None and get_param(cfg.checkpoint_params,
+                                                                                     "pretrained_weights") is None:
+            raise ValueError("Starting checkpoint / pretrained weights are a must for QAT finetuning.")
+
+        num_gpus = core_utils.get_param(cfg, "num_gpus")
+        multi_gpu = core_utils.get_param(cfg, "multi_gpu")
+        device = core_utils.get_param(cfg, "device")
+        if num_gpus != 1:
+            raise NotImplementedError(
+                f"Recipe requests multi_gpu={cfg.multi_gpu} and num_gpus={cfg.num_gpus}. QAT is proven to work correctly only with multi_gpu=OFF and num_gpus=1"
+            )
+
+        # INSTANTIATE DATA LOADERS
+        train_dataloader = dataloaders.get(
+            name=get_param(cfg, "train_dataloader"),
+            dataset_params=copy.deepcopy(cfg.dataset_params.train_dataset_params),
+            dataloader_params=copy.deepcopy(cfg.dataset_params.train_dataloader_params),
+        )
+
+        val_dataloader = dataloaders.get(
+            name=get_param(cfg, "val_dataloader"),
+            dataset_params=copy.deepcopy(cfg.dataset_params.val_dataset_params),
+            dataloader_params=copy.deepcopy(cfg.dataset_params.val_dataloader_params),
+        )
+
+        if "calib_dataloader" in cfg:
+            calib_dataloader_name = get_param(cfg, "calib_dataloader")
+            calib_dataloader_params = copy.deepcopy(cfg.dataset_params.calib_dataloader_params)
+            calib_dataset_params = copy.deepcopy(cfg.dataset_params.calib_dataset_params)
+        else:
+            calib_dataloader_name = get_param(cfg, "train_dataloader")
+            calib_dataloader_params = copy.deepcopy(cfg.dataset_params.train_dataloader_params)
+            calib_dataset_params = copy.deepcopy(cfg.dataset_params.train_dataset_params)
+
+            # if we use whole dataloader for calibration, don't shuffle it
+            # HistogramCalibrator collection routine is sensitive to order of batches and produces slightly different results
+            # if we use several batches, we don't want it to be from one class if it's sequential in dataloader
+            # model is in eval mode, so BNs will not be affected
+            calib_dataloader_params.shuffle = cfg.quantization_params.calib_params.num_calib_batches is not None
+            # we don't need training transforms during calibration, distribution of activations will be skewed
+            calib_dataset_params.transforms = cfg.dataset_params.val_dataset_params.transforms
+
+        calib_dataloader = dataloaders.get(
+            name=calib_dataloader_name,
+            dataset_params=calib_dataset_params,
+            dataloader_params=calib_dataloader_params,
+        )
+
+        # BUILD MODEL
+        model = models.get(
+            model_name=cfg.arch_params.get("model_name", None) or cfg.architecture,
+            num_classes=cfg.get("num_classes", None) or cfg.arch_params.num_classes,
+            arch_params=cfg.arch_params,
+            strict_load=cfg.checkpoint_params.strict_load,
+            pretrained_weights=cfg.checkpoint_params.pretrained_weights,
+            checkpoint_path=cfg.checkpoint_params.checkpoint_path,
+            load_backbone=False,
+            checkpoint_num_classes=get_param(cfg.checkpoint_params, "checkpoint_num_classes"),
+            num_input_channels=get_param(cfg.arch_params, "num_input_channels"),
+        )
+
+        recipe_logged_cfg = {"recipe_config": OmegaConf.to_container(cfg, resolve=True)}
+        trainer = Trainer(experiment_name=cfg.experiment_name, ckpt_root_dir=get_param(cfg, "ckpt_root_dir"))
+
+        if quantization_params.ptq_only:
+            res = trainer.ptq(
+                calib_loader=calib_dataloader,
+                model=model,
+                quantization_params=quantization_params,
+                valid_loader=val_dataloader,
+                valid_metrics_list=cfg.training_hyperparams.valid_metrics_list,
+            )
+        else:
+            res = trainer.qat(
+                model=model,
+                quantization_params=quantization_params,
+                calib_loader=calib_dataloader,
+                valid_loader=val_dataloader,
+                train_loader=train_dataloader,
+                training_params=cfg.training_hyperparams,
+                additional_qat_configs_to_log=recipe_logged_cfg,
+            )
+
+        return model, res
+
+    def qat(
+            self,
+            calib_loader: DataLoader,
+            model: torch.nn.Module,
+            valid_loader: DataLoader,
+            train_loader: DataLoader,
+            training_params: Mapping = None,
+            quantization_params: Mapping = None,
+            additional_qat_configs_to_log: Dict = None,
+            valid_metrics_list: List[Metric] = None,
+    ):
+        """
+        Performs post-training quantization (PTQ), and then quantization-aware training (QAT).
+        Exports the ONNX models (ckpt_best.pth of QAT and the calibrated model) to the checkpoints directory.
+
+        :param calib_loader: DataLoader, data loader for calibration.
+
+        :param model: torch.nn.Module, Model to perform QAT/PTQ on. When None, will try to use the network from
+        previous self.train call(that is, if there was one - will try to use self.ema_model.ema if EMA was used,
+        otherwise self.net)
+
+
+        :param valid_loader: DataLoader, data loader for validation. Used both for validating the calibrated model after PTQ and during QAT.
+            When None, will try to use self.valid_loader if it was set in previous self.train(..) call (default=None).
+
+        :param train_loader: DataLoader, data loader for QA training, can be ignored when quantization_params["ptq_only"]=True (default=None).
+
+        :param quantization_params: Mapping, with the following entries:defaults-
+            selective_quantizer_params:
+              calibrator_w: "max"        # calibrator type for weights, acceptable types are ["max", "histogram"]
+              calibrator_i: "histogram"  # calibrator type for inputs acceptable types are ["max", "histogram"]
+              per_channel: True          # per-channel quantization of weights, activations stay per-tensor by default
+              learn_amax: False          # enable learnable amax in all TensorQuantizers using straight-through estimator
+              skip_modules:              # optional list of module names (strings) to skip from quantization
+
+            calib_params:
+              histogram_calib_method: "percentile"  # calibration method for all "histogram" calibrators,
+                                                                # acceptable types are ["percentile", "entropy", mse"],
+                                                                # "max" calibrators always use "max"
+
+              percentile: 99.99                     # percentile for all histogram calibrators with method "percentile",
+                                                    # other calibrators are not affected
+
+              num_calib_batches:                    # number of batches to use for calibration, if None, 512 / batch_size will be used
+              verbose: False                        # if calibrator should be verbose
+
+
+              When None, the above default config is used (default=None)
+
+
+        :param training_params: Mapping, training hyper parameters for QAT, same as in super.train(...). When None, will try to use self.training_params
+         which is set in previous self.train(..) call (default=None).
+
+        :param additional_qat_configs_to_log: Dict, Optional dictionary containing configs that will be added to the QA training's
+         sg_logger. Format should be {"Config_title_1": {...}, "Config_title_2":{..}}.
+
+        :param valid_metrics_list:  (list(torchmetrics.Metric)) metrics list for evaluation of the calibrated model.
+        When None, the validation metrics from training_params are used). (default=None).
+
+        :return: Validation results of the QAT model in case quantization_params['ptq_only']=False and of the PTQ
+        model otherwise.
+        """
+
+        if quantization_params is None:
+            quantization_params = load_recipe("quantization_params/default_quantization_params").quantization_params
+            logger.info(f"Using default quantization params: {quantization_params}")
+        valid_metrics_list = valid_metrics_list or get_param(training_params, "valid_metrics_list")
+
+        _ = self.ptq(
+            calib_loader=calib_loader,
+            model=model,
+            quantization_params=quantization_params,
+            valid_loader=valid_loader,
+            valid_metrics_list=valid_metrics_list,
+            deepcopy_model_for_export=True,
+        )
+        # TRAIN
+        model.train()
+        torch.cuda.empty_cache()
+
+        res = self.train(
+            model=model,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            training_params=training_params,
+            additional_configs_to_log=additional_qat_configs_to_log,
+        )
+
+        # EXPORT QUANTIZED MODEL TO ONNX
+        input_shape = next(iter(valid_loader))[0].shape
+        os.makedirs(self.checkpoints_dir_path, exist_ok=True)
+        qdq_onnx_path = os.path.join(self.checkpoints_dir_path,
+                                     f"{self.experiment_name}_{'x'.join((str(x) for x in input_shape))}_qat.onnx")
+
+        # TODO: modify SG's convert_to_onnx for quantized models and use it instead
+        export_quantized_module_to_onnx(
+            model=model.cpu(),
+            onnx_filename=qdq_onnx_path,
+            input_shape=input_shape,
+            input_size=input_shape,
+            train=False,
+        )
+        logger.info(f"Exported QAT ONNX to {qdq_onnx_path}")
+        return res
+
+    def ptq(
+            self,
+            calib_loader: DataLoader,
+            model: nn.Module,
+            valid_loader: DataLoader,
+            valid_metrics_list: List[torchmetrics.Metric],
+            quantization_params: Dict = None,
+            deepcopy_model_for_export: bool = False,
+    ):
+        """
+        Performs post-training quantization (calibration of the model)..
+
+        :param calib_loader: DataLoader, data loader for calibration.
+
+        :param model: torch.nn.Module, Model to perform calibration on. When None, will try to use self.net which is
+        set in previous self.train(..) call (default=None).
+
+        :param valid_loader: DataLoader, data loader for validation. Used both for validating the calibrated model.
+            When None, will try to use self.valid_loader if it was set in previous self.train(..) call (default=None).
+
+        :param quantization_params: Mapping, with the following entries:defaults-
+            selective_quantizer_params:
+              calibrator_w: "max"        # calibrator type for weights, acceptable types are ["max", "histogram"]
+              calibrator_i: "histogram"  # calibrator type for inputs acceptable types are ["max", "histogram"]
+              per_channel: True          # per-channel quantization of weights, activations stay per-tensor by default
+              learn_amax: False          # enable learnable amax in all TensorQuantizers using straight-through estimator
+              skip_modules:              # optional list of module names (strings) to skip from quantization
+
+            calib_params:
+              histogram_calib_method: "percentile"  # calibration method for all "histogram" calibrators,
+                                                                # acceptable types are ["percentile", "entropy", mse"],
+                                                                # "max" calibrators always use "max"
+
+              percentile: 99.99                     # percentile for all histogram calibrators with method "percentile",
+                                                    # other calibrators are not affected
+
+              num_calib_batches:                    # number of batches to use for calibration, if None, 512 / batch_size will be used
+              verbose: False                        # if calibrator should be verbose
+
+
+              When None, the above default config is used (default=None)
+
+
+
+        :param valid_metrics_list:  (list(torchmetrics.Metric)) metrics list for evaluation of the calibrated model.
+
+        :param deepcopy_model_for_export: bool, Whether to export deepcopy(model). Necessary in case further training is
+            performed and prep_model_for_conversion makes the network un-trainable (i.e RepVGG blocks).
+
+        :return: Validation results of the calibrated model.
+        """
+
+        logger.debug("Performing post-training quantization (PTQ)...")
+        logger.debug(f"Experiment name {self.experiment_name}")
+
+        run_id = core_utils.get_param(self.training_params, "run_id", None)
+        logger.debug(f"Experiment run id {run_id}")
+
+        self.checkpoints_dir_path = get_checkpoints_dir_path(ckpt_root_dir=self.ckpt_root_dir,
+                                                             experiment_name=self.experiment_name, run_id=run_id)
+        logger.debug(f"Checkpoints directory {self.checkpoints_dir_path}")
+
+        os.makedirs(self.checkpoints_dir_path, exist_ok=True)
+
+        from super_gradients.training.utils.quantization.fix_pytorch_quantization_modules import \
+            patch_pytorch_quantization_modules_if_needed
+
+        patch_pytorch_quantization_modules_if_needed()
+
+        if quantization_params is None:
+            quantization_params = load_recipe("quantization_params/default_quantization_params").quantization_params
+            logger.info(f"Using default quantization params: {quantization_params}")
+
+        model = self.accelerator.unwrap_model(
+            model)  # Unwrap model in case it is wrapped with DataParallel or DistributedDataParallel
+        model = model.to(self.accelerator.device).eval()
+
+        selective_quantizer_params = get_param(quantization_params, "selective_quantizer_params")
+        calib_params = get_param(quantization_params, "calib_params")
+        # QUANTIZE MODEL
+        fuse_repvgg_blocks_residual_branches(model)
+        q_util = SelectiveQuantizer(
+            default_quant_modules_calibrator_weights=get_param(selective_quantizer_params, "calibrator_w"),
+            default_quant_modules_calibrator_inputs=get_param(selective_quantizer_params, "calibrator_i"),
+            default_per_channel_quant_weights=get_param(selective_quantizer_params, "per_channel"),
+            default_learn_amax=get_param(selective_quantizer_params, "learn_amax"),
+            verbose=get_param(calib_params, "verbose"),
+        )
+        q_util.register_skip_quantization(layer_names=get_param(selective_quantizer_params, "skip_modules"))
+        q_util.quantize_module(model)
+        # CALIBRATE MODEL
+        logger.info("Calibrating model...")
+        calibrator = QuantizationCalibrator(
+            verbose=get_param(calib_params, "verbose"),
+            torch_hist=True,
+        )
+        calibrator.calibrate_model(
+            model,
+            method=get_param(calib_params, "histogram_calib_method"),
+            calib_data_loader=calib_loader,
+            num_calib_batches=get_param(calib_params, "num_calib_batches") or len(calib_loader),
+            percentile=get_param(calib_params, "percentile", 99.99),
+        )
+        calibrator.reset_calibrators(model)  # release memory taken by calibrators
+        # VALIDATE PTQ MODEL AND PRINT SUMMARY
+        logger.info("Validating PTQ model...")
+        valid_metrics_dict = self.test(model=model, test_loader=valid_loader, test_metrics_list=valid_metrics_list)
+        results = ["PTQ Model Validation Results"]
+        results += [f"   - {metric:10}: {value}" for metric, value in valid_metrics_dict.items()]
+        logger.info("\n".join(results))
+
+        input_shape = next(iter(valid_loader))[0].shape
+        input_shape_with_batch_size_one = tuple([1] + list(input_shape[1:]))
+        qdq_onnx_path = os.path.join(
+            self.checkpoints_dir_path,
+            f"{self.experiment_name}_{'x'.join((str(x) for x in input_shape_with_batch_size_one))}_ptq.onnx"
+        )
+        logger.debug(f"Output ONNX file path {qdq_onnx_path}")
+
+        if isinstance(model, ExportableObjectDetectionModel):
+            model: ExportableObjectDetectionModel = typing.cast(ExportableObjectDetectionModel, model)
+            export_result = model.export(
+                output=qdq_onnx_path,
+                quantization_mode=ExportQuantizationMode.INT8,
+                input_image_shape=(input_shape_with_batch_size_one[2], input_shape_with_batch_size_one[3]),
+                preprocessing=False,
+                postprocessing=True,
+            )
+            logger.info(repr(export_result))
+        else:
+            # TODO: modify SG's convert_to_onnx for quantized models and use it instead
+            export_quantized_module_to_onnx(
+                model=model.cpu(),
+                onnx_filename=qdq_onnx_path,
+                input_shape=input_shape_with_batch_size_one,
+                input_size=input_shape_with_batch_size_one,
+                train=False,
+                deepcopy_model=deepcopy_model_for_export,
+            )
+
+        return valid_metrics_dict

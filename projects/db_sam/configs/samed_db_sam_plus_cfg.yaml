@@ -1,0 +1,14 @@
+
+
+defaults:
+  - training_hyperparams: samed_db_sam_plus_train_params
+  - dataset_params: medsam_dataset_params
+  - model_params: db_sam_plus_model_params
+#  - checkpoint_params: default_checkpoint_params
+  - _self_
+#  - variable_setup  TODO what is this?
+
+experiment_name: debug_hydra
+multi_gpu: DDP
+num_gpus: 1
+sam_ckpt_path: /home/qinc/Code/Segmentation/MedSAM/work_dir/SAM/sam_vit_b_01ec64.pth

@@ -1,0 +1,48 @@
+defaults:
+  - default_train_params
+max_epochs: 20
+save_ckpt_epoch_list: [0, 5, 10, 15, 20]
+#  _target_: numpy.arange     if we want to use numpy.arange, maybe we need to change the corresponding content in
+# default_train_params.yaml to save_ckpt_epoch_list:  _target_: super_gradients.training.utils.utils.empty_list. See
+# lr_updates in the default_train_params.yaml for more details.
+#  start: 0
+#  stop: 20
+#  step: 1
+
+lr_mode: PolyLRScheduler
+lr_warmup_epochs: 1
+initial_lr: 1e-4
+
+loss: SegLoss
+criterion_params:
+  include_background: True
+
+optimizer: AdamW
+optimizer_params:
+  weight_decay: 0.01
+  betas:
+    - 0.9
+    - 0.999
+  eps: 1e-8
+
+phase_callbacks:
+  - ModeSwitchCallback
+  - ComputeAverage3DDiceScore
+
+metric_to_watch: SegLoss
+greater_metric_to_watch_is_better: False
+valid_metrics_list:
+  - _target_: training.metrics.dice.DICEScore
+  - _target_: training.metrics.surface_dice.SurfaceDICEScore
+run_validation_freq: 1
+run_test_freq: 1
+
+mixed_precision: fp16
+syc_bn: False
+
+
+#hydra:
+#  searchpath:
+#    - /home/qinc/Code/MedicalSAM/super-gradients/src/super_gradients/recipes/training_hyperparams
+
+_convert_: all

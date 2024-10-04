@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+#SBATCH -A NAISS2023-1-24           # Account (project) - You might need to adjust this
+#SBATCH -p alvis                    # Partition (queue)
+#SBATCH -t 00-23:00:00               # Time limit (1 day)
+#SBATCH --gres=gpu:A100:1            # 4 GPUs
+#SBATCH --job-name=testsam           # Change "my_train_job" to a meaningful name
+#SBATCH -o slurm_output_%j.out      # Redirects stdout to a file (optional)
+#SBATCH -e slurm_error_%j.err       # Redirects stderr to a file (optional)
+#SBATCH --nodes=1                   # Request one node
+#SBATCH --ntasks-per-node=1         # Run 4 tasks on this node
+#SBATCH --cpus-per-task=8           # Request 8 CPUs (if required)
+
+# Avoiding /home quota exceed
+export TORCH_HOME=/mimer/NOBACKUP/groups/alvis_cvl
+export PIP_CACHE_DIR=/mimer/NOBACKUP/groups/alvis_cvl
+export HF_HOME=/mimer/NOBACKUP/groups/alvis_cvl/
+
+# Actual command to run
+python sam_inference.py \
+--experiment_name test_sam \
+--train_dataset_type SAMImageNpyDataset \
+--train_data_root /mimer/NOBACKUP/groups/alvis_cvl/Fahad/chaoqin/Dataset/MedSAM/Train \
+--test_data_dir /mimer/NOBACKUP/groups/alvis_cvl/Fahad/chaoqin/Dataset/MedSAM/Test \
+--num_workers 8 \
+--train_batch_size 3 \
+--add_box_perturbation \
+--num_gpus 1 \
+--max_epochs 12 \
+--lr 1e-4 \
+--lr_mode PolyLRScheduler \
+--weight_decay 0.01 \
+--warmup_mode LinearBatchLRWarmup \
+--lr_warmup_epochs 1 \
+--warmup_initial_lr 1e-7 \
+--lr_warmup_steps 13000 \
+--step_lr_update_freq 5 \
+--include_background \
+--model_name sam \
+--model_config_path ./configs/multistages_multiscales_conv_vit_adapter_hq_cfg.py \
+--sam_checkpoint /mimer/NOBACKUP/groups/alvis_cvl/Fahad/chaoqin/pretrained_weights/SAM/sam_vit_b_01ec64.pth

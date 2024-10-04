@@ -1,0 +1,33 @@
+
+train_dataset_params:
+  SAMImageNpyDataset:
+    root: /home/qinc/Dataset/MedSAM-Train
+    samples_sub_directory: "npy_images"
+    sample_extensions: ".npz"
+    sample_loader:
+      _partial_: True
+      _target_: train.sample_loader
+    targets_sub_directory: "npy_gts"
+    target_extension: ".npy"
+    target_loader:
+      _partial_: True
+      _target_: numpy.load
+    add_box_perturbation: True
+    perturbation_value: 20
+
+train_dataloader_params:
+    batch_size: 1
+    num_workers: 1
+    drop_last: True
+    pin_memory: True
+
+test_dataset_params:
+  root: /home/qinc/Dataset/MedSAM-Test
+  add_box_perturbation: True
+  perturbation_value: 20
+
+test_dataloader_params:
+    batch_size: 1
+    num_workers: 1
+    drop_last: False
+    pin_memory: True
